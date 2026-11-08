@@ -8,12 +8,13 @@
  */
 import {
 	type Component,
+	type OverlayOptions,
 	type Terminal,
 	truncateToWidth,
 	type TUI,
 	visibleWidth,
 	wrapTextWithAnsi,
-} from "@mariozechner/pi-tui";
+} from "./tui.js";
 import { applySetCommand, CONFIG_TEMPLATE, configPath, DEFAULT_UI, type UiOptions } from "./config.js";
 import { setTomlValue, tomlValue } from "./config-edit.js";
 import { type SettingItem, SettingsFloat } from "./settings.js";
@@ -35,6 +36,13 @@ import {
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { setDetached } from "./agents.js";
+import { dropPatch, parseDiff, restorePatch } from "./hunks.js";
+import { HunkReview } from "./hunk-review.js";
+import { listFiles, MENTION, mentionable } from "./attach.js";
+import { allTemplates, fillTemplate, needsTask, type Template } from "./templates.js";
+import type { PiUiHost } from "./pi-ui.js";
+import { didYouMean } from "./suggest.js";
+import { alertSequence, NOTIFY_MODES, type NotifyMode } from "./notify.js";
 import { VERSION_TEXT } from "./version.js";
 import { backendName, formatBytes, riftriBackends, type RiftriHealth, RIFTRI_INSTALL } from "./riftri.js";
 import { defaultEngine as defaultEngineFor, ENGINE_NAMES, type EngineId, type EngineInfo, isEngineId } from "./engines.js";
@@ -43,11 +51,11 @@ import { splitView, unifiedView } from "./diffview.js";
 import { TREE_GLYPHS, type TreeRow } from "./tree.js";
 import { transcriptMarkdown } from "./export.js";
 import { renderMarkdown } from "./markdown.js";
-import { ChoicePicker, PICKER_ICONS, type PickerChoice, ThemePicker } from "./picker.js";
+import { ChoicePicker, type ChoicePickerOptions, PICKER_ICONS, type PickerChoice, ThemePicker } from "./picker.js";
 import { EFFORTS, effortChoicesFor, modelChoices } from "./choices.js";
 import { ICON_SETS, NERD, toolIcon } from "./icons.js";
 import { mergeWorktree, openPullRequest } from "./review.js";
-import type { Session, SessionState } from "./session.js";
+import type { PiSession, Session, SessionState } from "./session.js";
 import { type Attr, BUILTIN_THEMES, extractPalette, listThemes, loadTheme, type Painter, RESET, sgr, type Theme, themeFileFor, themesDir } from "./theme.js";
 import { parseHighlightCommand } from "./vimcolors.js";
 import {
@@ -94,6 +102,8 @@ interface Icons {
 	queued: string;
 	open_agent: string;
 	here: string;
+	/** an agent finished (or failed) while you looked elsewhere */
+	unread: string;
 	ok: string;
 	warn: string;
 	off: string;
@@ -117,6 +127,7 @@ const ICONS: Record<UiOptions["icons"], Icons> = {
 		queued: "⧗",
 		open_agent: "▸",
 		here: "●",
+		unread: "◆",
 		ok: "●",
 		warn: "◐",
 		off: "○",
@@ -138,6 +149,7 @@ const ICONS: Record<UiOptions["icons"], Icons> = {
 		queued: NERD.clock,
 		open_agent: "▸",
 		here: NERD.circle,
+		unread: NERD.bell,
 		ok: NERD.check,
 		warn: NERD.warning,
 		off: NERD.circleO,
@@ -159,6 +171,7 @@ const ICONS: Record<UiOptions["icons"], Icons> = {
 		queued: "+",
 		open_agent: ">",
 		here: "*",
+		unread: "!",
 		ok: "+",
 		warn: "~",
 		off: "-",
@@ -222,6 +235,8 @@ export class App implements Component {
 	/** model and effort for new agents, per engine ([engines.<id>] in config.toml, :model / :effort with no agent) */
 	newAgentModel: Partial<Record<EngineId, string>> = {};
 	newAgentEffort: Partial<Record<EngineId, string>> = {};
+	/** yours, from [templates] in config.toml (the built-in ones are added to these) */
+	templates: Record<string, Template> = {};
 	/** save an agent's settings (model, effort) so they survive a restart */
 	persist: (s: Session) => void = () => {};
 	/** `engine` from config.toml or :settings; "auto" lets defaultEngine() pick */
@@ -236,7 +251,7 @@ export class App implements Component {
 	/** VISUAL selection, as line indices into the transcript pane */
 	private visual = { anchor: 0, cursor: 0 };
 	/** a y/n question in the command line (dd, quitting with agents running) */
-	private confirm?: { question: string; onYes: () => void };
+	private confirm?: { question: string; onYes: () => void; onNo?: () => void };
 	/** copies text to the system clipboard; returns how (replaced in tests) */
 	clipboard: (text: string) => string = (text) => copyToClipboard(text, (d) => this.terminal.write(d));
 
@@ -279,8 +294,11 @@ export class App implements Component {
 	}
 
 	addSession(s: Session, focus = true) {
+		if ("extensionStatus" in s) (s as PiSession).uiHost = this.piUiHost(s);
 		this.sessions.push(s);
+		this.lastState.set(s, s.state);
 		s.onChange(() => {
+			this.watchState(s);
 			this.syncSpinner();
 			this.tui.requestRender();
 		});
@@ -300,8 +318,34 @@ export class App implements Component {
 		this.tui.requestRender();
 	}
 
+	/** agents that finished, failed or wait for you while you looked elsewhere */
+	unread = new Set<Session>();
+	/** the terminal window has focus (from focus reporting; assumed until told otherwise) */
+	terminalFocused = true;
+	private lastState = new WeakMap<Session, SessionState>();
+	/** where notifications go (replaced in tests) */
+	alert: (bytes: string) => void = (bytes) => this.terminal.write(bytes);
+
+	/** An agent stopped running: if you're not looking at it, say so (bell, desktop notification, sidebar mark). */
+	private watchState(s: Session) {
+		const before = this.lastState.get(s);
+		this.lastState.set(s, s.state);
+		if (before === "running" && s.state !== "running") this.persist(s); // its usage totals, for after a restart
+		if (before !== "running" || s.state === "running" || s.state === "paused") return;
+		const visible = s === this.focusedSession && this.terminalFocused;
+		if (visible) return;
+		this.unread.add(s);
+		const n = this.sessions.indexOf(s) + 1;
+		const what = s.state === "error" ? "failed" : s.state === "waiting" ? "needs you" : "finished";
+		if (s !== this.focusedSession) {
+			this.setMessage(`'${s.name}' ${what} · ${n <= 9 ? `${n} or ` : ""}]s to open it`, s.state === "error" ? "ErrorMsg" : "ModeMsg");
+		}
+		this.alert(alertSequence(`vigent: '${s.name}' ${what}`, this.ui.notify));
+	}
+
 	private focusSession(idx: number) {
 		if (idx < 0 || idx >= this.sessions.length || idx === this.focusIdx) return;
+		this.unread.delete(this.sessions[idx]);
 		this.altIdx = this.focusIdx;
 		this.focusIdx = idx;
 		this.scrollOffset = 0;
@@ -363,17 +407,26 @@ export class App implements Component {
 	}
 
 	/** Ask a y/n question in the command line, like vim's confirm prompts. */
-	private ask(question: string, onYes: () => void) {
+	private ask(question: string, onYes: () => void, onNo?: () => void) {
 		this.seq.reset();
-		this.confirm = { question, onYes };
+		this.confirm?.onNo?.(); // a newer question replaces an unanswered one: that one is a no
+		this.confirm = { question, onYes, onNo };
 	}
 
 	handleInput(data: string): void {
+		// focus reporting: the terminal window gained or lost focus (never an answer to a question)
+		if (data === "\x1b[I" || data === "\x1b[O") {
+			this.terminalFocused = data === "\x1b[I";
+			if (this.terminalFocused && this.focusedSession) this.unread.delete(this.focusedSession);
+			this.tui.requestRender();
+			return;
+		}
 		if (this.confirm) {
-			const { onYes } = this.confirm;
+			const { onYes, onNo } = this.confirm;
 			this.confirm = undefined;
 			this.message = "";
 			if (data === "y" || data === "Y") onYes();
+			else onNo?.();
 			this.tui.requestRender();
 			return;
 		}
@@ -409,6 +462,11 @@ export class App implements Component {
 	}
 
 	private typeText(text: string) {
+		if (this.mode === "INSERT" && text === "@" && (this.inputBuf === "" || /\s$/.test(this.inputBuf))) {
+			this.inputBuf += text;
+			this.openAttach();
+			return;
+		}
 		if (this.mode === "INSERT") this.inputBuf += text;
 		else if (this.mode === "COMMAND" || this.mode === "SEARCH") this.cmdBuf += text;
 	}
@@ -729,6 +787,14 @@ export class App implements Component {
 			case "dashboard":
 				this.openDashboard();
 				return;
+			case "cost":
+			case "usage":
+				this.openUsage();
+				return;
+			case "pi":
+			case "extensions":
+				this.openPiResources();
+				return;
 			case "tree":
 				this.openTree();
 				return;
@@ -752,17 +818,33 @@ export class App implements Component {
 			case "new!": {
 				const modelFlag = /(?:^|\s)--model[= ](\S+)/.exec(arg);
 				const engineFlag = /(?:^|\s)(?:--engine|-e)[= ](\S+)/.exec(arg);
-				const name =
-					arg
-						.replace(/(?:^|\s)--model[= ]\S+/, "")
-						.replace(/(?:^|\s)(?:--engine|-e)[= ]\S+/, "")
-						.trim() || `agent-${this.sessions.length + 1}`;
-				this.startAgent(name, { worktree: cmd === "new", model: modelFlag?.[1], engine: engineFlag?.[1] });
+				const templateFlag = /(?:^|\s)(?:--template|-t)[= ](\S+)/.exec(arg);
+				const rest = arg
+					.replace(/(?:^|\s)--model[= ]\S+/, "")
+					.replace(/(?:^|\s)(?:--engine|-e)[= ]\S+/, "")
+					.replace(/(?:^|\s)(?:--template|-t)[= ]\S+/, "")
+					.trim();
+				if (templateFlag) {
+					this.startFromTemplate(templateFlag[1], rest, { worktree: cmd === "new" ? undefined : false, model: modelFlag?.[1], engine: engineFlag?.[1] });
+					return;
+				}
+				this.startAgent(rest || `agent-${this.sessions.length + 1}`, { worktree: cmd === "new", model: modelFlag?.[1], engine: engineFlag?.[1] });
+				return;
+			}
+			case "templates":
+			case "template":
+			case "tpl": {
+				if (!arg) this.openTemplatePicker();
+				else this.exec(`new -t ${arg}`);
 				return;
 			}
 			case "kill":
 			case "kill!":
 				this.killFocused(cmd === "kill!");
+				return;
+			case "review":
+			case "hunks":
+				this.openReview();
 				return;
 			case "diff":
 				this.openDiff(/^(split|vert|vertical|side)$/.test(arg));
@@ -1114,13 +1196,111 @@ export class App implements Component {
 		return "chosenModel" in t.session ? (t.session as { chosenModel?: string }).chosenModel : t.session.model;
 	}
 
+	/** Every template: the built-in ones, then yours. */
+	allTemplates(): Template[] {
+		return allTemplates(this.templates);
+	}
+
+	/**
+	 * `:new -t <template> [task]`: start an agent with the template's engine,
+	 * model and effort, and send it the template's prompt. Flags you type
+	 * (--engine, --model) win over the template's.
+	 */
+	startFromTemplate(name: string, task: string, opts: { worktree?: boolean; model?: string; engine?: string } = {}): Session | undefined {
+		const all = this.allTemplates();
+		const t = all.find((x) => x.name === name);
+		if (!t) {
+			this.setMessage(`no template '${name}'${didYouMean(name, all.map((x) => x.name))} · :templates lists them`, "ErrorMsg");
+			return undefined;
+		}
+		if (needsTask(t) && !task && !(t.builtin && t.name === "review")) {
+			this.setMessage(`template '${t.name}' needs a task: :new -t ${t.name} <what>`, "ErrorMsg");
+			this.mode = "COMMAND";
+			this.cmdBuf = `new -t ${t.name} `;
+			return undefined;
+		}
+		const engine = opts.engine ?? t.engine;
+		const s = this.startAgent(task ? agentNameFrom(task) : t.name, {
+			worktree: opts.worktree ?? t.worktree,
+			model: opts.model ?? (engine === t.engine || !t.engine ? t.model : undefined),
+			engine,
+			effort: !opts.engine || opts.engine === t.engine ? t.effort : undefined,
+		});
+		if (!s) return undefined;
+		s.submit(fillTemplate(t, task));
+		this.setMessage(`${this.message} · template ${t.name}`, this.messageGroup);
+		return s;
+	}
+
+	/** `:templates`: pick one; the command line then takes the task. */
+	openTemplatePicker() {
+		const items = this.allTemplates().map((t) => {
+			const how = [t.engine ? ENGINE_NAMES[t.engine] : "", t.model ?? "", t.effort ?? ""].filter(Boolean).join(" · ");
+			const what = t.description ?? t.prompt.split("\n")[0];
+			return { value: t.name, note: `${what}${how ? ` (${how})` : ""}${t.builtin ? "" : " · yours"}` };
+		});
+		const place = { width: Math.min(96, this.terminal.columns - 4), anchor: "center" as const };
+		this.openChoices("Start an agent from a template", items, "", false, (name) => {
+			const t = this.allTemplates().find((x) => x.name === name);
+			if (t && !needsTask(t)) {
+				this.startFromTemplate(name, "");
+				return;
+			}
+			this.mode = "COMMAND";
+			this.cmdBuf = `new -t ${name} `;
+			this.setMessage(t?.builtin && t.name === "review" ? "what to focus on (optional), then Enter" : "what it's for, then Enter", "Comment");
+		}, {}, place);
+	}
+
 	/** where effort levels come from (replaced in tests) */
 	effortChoices: (engine: EngineId, model?: string) => Promise<PickerChoice[]> = (engine, model) => effortChoicesFor(engine, model);
 
 	/** where model lists come from (replaced in tests) */
 	modelChoices: (engine: EngineId) => Promise<PickerChoice[]> = (engine) => modelChoices(engine);
 
-	private openChoices(title: string, items: PickerChoice[] | Promise<PickerChoice[]>, current: string, custom: boolean, done: (v: string) => void) {
+	/** where `@` finds files to attach (replaced in tests) */
+	listFiles: (cwd: string) => Promise<string[]> = (cwd) => listFiles(cwd);
+
+	/** the folder the focused agent works in: its worktree, or this checkout */
+	attachDir(): string {
+		const s = this.focusedSession as (Session & { cwd?: string }) | undefined;
+		return s?.cwd ?? s?.worktree?.path ?? this.workspace.root ?? process.cwd();
+	}
+
+	/**
+	 * `@` in the prompt: pick a file from the agent's folder. Enter writes
+	 * `@path `, Esc keeps a plain `@`, Backspace takes the `@` back.
+	 */
+	openAttach() {
+		const dir = this.attachDir();
+		const items = this.listFiles(dir).then((files) => files.filter(mentionable).map((value) => ({ value })));
+		const takeBack = () => {
+			if (this.inputBuf.endsWith("@")) this.inputBuf = this.inputBuf.slice(0, -1);
+		};
+		this.openChoices(
+			`Attach a file · ${path.basename(dir)}`,
+			items,
+			"",
+			false,
+			(v) => {
+				takeBack();
+				this.inputBuf += `@${v} `;
+			},
+			{ search: true, onBackOut: takeBack, rows: 8 },
+			// a completion menu: just above the prompt, where you're typing
+			{ anchor: "bottom-left", col: this.sidebarWidth(this.terminal.columns) + 2, offsetY: -2, width: Math.min(64, this.terminal.columns - 2) },
+		);
+	}
+
+	private openChoices(
+		title: string,
+		items: PickerChoice[] | Promise<PickerChoice[]>,
+		current: string,
+		custom: boolean,
+		done: (v: string) => void,
+		opts: ChoicePickerOptions & { onCancel?: () => void } = {},
+		place: OverlayOptions = { width: Math.min(72, this.terminal.columns - 4), anchor: "center" },
+	) {
 		this.seq.reset();
 		let handle: { hide(): void } | undefined;
 		const picker = new ChoicePicker(
@@ -1133,11 +1313,22 @@ export class App implements Component {
 			(v) => {
 				handle?.hide();
 				if (v !== null) done(v);
+				else opts.onCancel?.();
 				this.repaint();
 			},
 			() => this.tui.requestRender(),
+			{
+				...opts,
+				onBackOut: opts.onBackOut
+					? () => {
+							handle?.hide();
+							opts.onBackOut?.();
+							this.repaint();
+						}
+					: undefined,
+			},
 		);
-		handle = this.tui.showOverlay(picker, { width: Math.min(72, this.terminal.columns - 4), anchor: "center" });
+		handle = this.tui.showOverlay(picker, place);
 		this.tui.requestRender();
 	}
 
@@ -1232,6 +1423,13 @@ export class App implements Component {
 				hint: "riftri: copy-on-write worktrees that share unchanged files (riftri.dev)",
 			},
 			{
+				section: "Agents",
+				label: "Notify when an agent finishes",
+				value: () => ({ auto: "auto (bell, and a desktop notification where the terminal shows one)", bell: "bell", desktop: "desktop notification", off: "off" })[ui.notify],
+				change: (d) => (ui.notify = cycle(NOTIFY_MODES, ui.notify, d) as NotifyMode),
+				hint: "when an agent finishes, fails or needs you while you're looking at another one (or another window)",
+			},
+			{
 				section: "Keys",
 				label: "which-key popup",
 				value: () => onOff(ui.whichkey),
@@ -1319,7 +1517,7 @@ export class App implements Component {
 			set(undefined, "theme", this.painter.theme.name);
 			set(undefined, "engine", this.preferredEngine);
 			set(undefined, "leader", this.keymap.leader);
-			for (const k of ["sidebar", "sidebar_width", "number", "tilde", "icons", "termguicolors", "transparent", "whichkey"] as const) set("ui", k, ui[k]);
+			for (const k of ["sidebar", "sidebar_width", "number", "tilde", "icons", "termguicolors", "transparent", "whichkey", "notify"] as const) set("ui", k, ui[k]);
 			set("worktree", "enabled", this.workspace.config.enabled);
 			set("worktree", "backend", this.workspace.config.backend ?? "auto");
 			for (const [lhs, rhs] of this.keyChanges) set("keys.normal", lhs, rhs);
@@ -1335,7 +1533,7 @@ export class App implements Component {
 	 * Start an agent (`:new`, or the first prompt typed with no agent yet).
 	 * Returns it, or undefined after showing why it couldn't start.
 	 */
-	startAgent(name: string, opts: { worktree?: boolean; model?: string; engine?: string } = {}): Session | undefined {
+	startAgent(name: string, opts: { worktree?: boolean; model?: string; engine?: string; effort?: string } = {}): Session | undefined {
 		const engine = opts.engine ?? this.defaultEngine();
 		if (!isEngineId(engine)) {
 			this.setMessage(`unknown engine '${engine}': pi, claude, codex or opencode`, "ErrorMsg");
@@ -1354,7 +1552,7 @@ export class App implements Component {
 		const withWorktree = opts.worktree !== false && this.workspace.config.enabled;
 		try {
 			const model = opts.model ?? this.newAgentModel[engine];
-			const effort = this.newAgentEffort[engine];
+			const effort = opts.effort ?? this.newAgentEffort[engine];
 			const s = this.newSession(name, { worktree: withWorktree, model, engine, ...(effort ? { effort } : {}) });
 			this.addSession(s);
 			const wt = s.worktree;
@@ -1532,7 +1730,9 @@ export class App implements Component {
 				[stateGroup(s.state), s.state.padEnd(8)],
 				["Comment", ` ${truncateToWidth(s.worktree ? `${I.worktree}${s.worktree.branch}` : s.model, 34, "…")}`],
 				...stat,
+				["Comment", s.tokens ? `  ${formatUsage(s)}` : ""],
 				["Comment", s.queue.length ? `  ${I.queued}${s.queue.length}` : ""],
+				[s.state === "error" ? "ErrorMsg" : "WarningMsg", this.unread.has(s) ? `  ${I.unread} new` : ""],
 			]);
 			lines.push([
 				["NormalFloat", "      "],
@@ -1541,8 +1741,147 @@ export class App implements Component {
 		});
 		const running = this.sessions.filter((s) => s.state === "running").length;
 		lines.push([]);
-		lines.push([["Comment", `${this.sessions.length} agents · ${running} running · j/k move · Enter open`]]);
+		const total = totalUsage(this.sessions);
+		lines.push([
+			["Comment", `${this.sessions.length} agents · ${running} running · `],
+			["NormalFloat", `${formatUsage(total)} in all`],
+			["Comment", " · j/k move · Enter open · :cost for more"],
+		]);
 		this.openFloat("Dashboard", lines, Math.min(110, this.terminal.columns - 4), {
+			selectable: rows,
+			onSelect: (lineIdx) => this.focusSession(rows.indexOf(lineIdx)),
+			initial: rows[this.focusIdx],
+		});
+	}
+
+	/**
+	 * Where a pi agent's extensions talk to you: confirm() is a y/n question in
+	 * the command line, select() and input() are pickers, notify() goes to the
+	 * transcript and the message line. Each names the agent it's from.
+	 */
+	piUiHost(s: Session): PiUiHost {
+		const who = () => `'${s.name}'`;
+		// one line, and emoji in text style (U+FE0F makes terminals disagree on their width)
+		const oneLine = (t: string) => t.replace(/\uFE0F/g, "").replace(/\s+/g, " ").trim();
+		const lookHere = () => {
+			if (s !== this.focusedSession || !this.terminalFocused) this.alert(alertSequence(`vigent: ${who()} asks you something`, this.ui.notify));
+		};
+		return {
+			select: (title, options) =>
+				new Promise((resolve) => {
+					lookHere();
+					this.openChoices(`${who()} · ${oneLine(title)}`, options.map((value) => ({ value })), "", false, resolve, {
+						onCancel: () => resolve(undefined),
+						rows: Math.max(3, Math.min(10, options.length)),
+					});
+				}),
+			confirm: (title, message) =>
+				new Promise((resolve) => {
+					lookHere();
+					const text = [title, message].filter(Boolean).map(oneLine).join(": ");
+					this.ask(`${who()} ${text} (y/n)`, () => resolve(true), () => resolve(false));
+					this.tui.requestRender();
+				}),
+			input: (title, placeholder) =>
+				new Promise((resolve) => {
+					lookHere();
+					this.openChoices(`${who()} · ${oneLine(title)}${placeholder ? ` (${oneLine(placeholder)})` : ""}`, [], "", true, resolve, { search: true, rows: 3, onCancel: () => resolve(undefined) });
+				}),
+			notify: (message, type) => {
+				s.pushInfo(message);
+				this.setMessage(`${who()}: ${message}`, type === "error" ? "ErrorMsg" : type === "warning" ? "WarningMsg" : "ModeMsg");
+				this.tui.requestRender();
+			},
+			setStatus: (key, text) => (s as PiSession).setExtensionStatus?.(key, text),
+		};
+	}
+
+	/** `:pi`: what pi loaded for the focused agent. Enter on a command, skill or prompt starts a prompt with it. */
+	openPiResources() {
+		const s = this.focusedSession;
+		if (!s || !("resources" in s)) {
+			this.setMessage(s ? `:pi lists a pi agent's extensions; '${s.name}' runs on ${ENGINE_NAMES[s.engine]}` : "no agent yet", "Comment");
+			return;
+		}
+		const r = (s as PiSession).resources();
+		if (!r) {
+			this.setMessage(`'${s.name}' is still starting`, "Comment");
+			return;
+		}
+		const lines: FloatLine[] = [];
+		const rows: number[] = [];
+		const typed: string[] = [];
+		const home = process.env.HOME ?? "";
+		const short = (p: string) => (home && p.startsWith(home) ? `~${p.slice(home.length)}` : this.shortPath(p));
+		const section = (title: string, n: number) => {
+			if (lines.length) lines.push([]);
+			lines.push([["Title", title], ["Comment", `  ${n}`]]);
+		};
+		const item = (name: string, note: string | undefined, insert?: string) => {
+			if (insert) {
+				rows.push(lines.length);
+				typed.push(insert);
+			}
+			lines.push([
+				["Identifier", `  ${name.padEnd(24)}`],
+				["Comment", note ? ` ${truncateToWidth(note.replace(/\s+/g, " "), 60, "…")}` : ""],
+			]);
+		};
+		section("Extensions", r.extensions.length);
+		if (!r.extensions.length) lines.push([["Comment", "  none (~/.pi/agent/extensions/ or .pi/extensions/)"]]);
+		for (const e of r.extensions) lines.push(e.error ? [["ErrorMsg", `  ${short(e.path)}`], ["Comment", `  ${e.error}`]] : [["NormalFloat", `  ${short(e.path)}`]]);
+		section("Commands", r.commands.length);
+		for (const c of r.commands) item(`/${c.name}`, c.description, `/${c.name} `);
+		section("Skills", r.skills.length);
+		for (const k of r.skills) item(`/skill:${k.name}`, k.description, `/skill:${k.name} `);
+		section("Prompt templates", r.prompts.length);
+		for (const p of r.prompts) item(`/${p.name}`, p.description, `/${p.name} `);
+		section("Context files", r.contextFiles.length);
+		for (const f of r.contextFiles) lines.push([["NormalFloat", `  ${short(f)}`]]);
+		lines.push([]);
+		lines.push([["Comment", "Enter starts a prompt with it · pi loads these itself, as in pi"]]);
+		this.openFloat(`pi · ${s.name}`, lines, Math.min(96, this.terminal.columns - 4), {
+			selectable: rows.length ? rows : undefined,
+			onSelect: (lineIdx) => {
+				const text = typed[rows.indexOf(lineIdx)];
+				if (!text) return;
+				this.mode = "INSERT";
+				this.inputBuf = text;
+			},
+		});
+	}
+
+	/** `:cost`: what each agent has used (tokens, and money where the engine reports it) and the total. */
+	openUsage() {
+		if (this.sessions.length === 0) {
+			this.setMessage("no agents yet (:new <task> starts one)", "Comment");
+			return;
+		}
+		const lines: FloatLine[] = [];
+		const rows: number[] = [];
+		const cell = (s: string, w: number) => truncateToWidth(s, w - 1, "…").padEnd(w);
+		lines.push([["Comment", `${cell("agent", 30)}${cell("engine", 13)}${"tokens".padStart(11)}${"cost".padStart(10)}`]]);
+		this.sessions.forEach((s) => {
+			rows.push(lines.length);
+			lines.push([
+				["Title", cell(s.name, 30)],
+				["Comment", cell(ENGINE_NAMES[s.engine], 13)],
+				["NormalFloat", formatTokens(s.tokens).replace(/ tok$/, "").padStart(11)],
+				[s.cost === undefined ? "Comment" : "String", (s.cost === undefined ? "—" : formatCost(s.cost)).padStart(10)],
+			]);
+		});
+		const total = totalUsage(this.sessions);
+		lines.push([["FloatBorder", "─".repeat(64)]]);
+		lines.push([
+			["Title", cell("all agents", 43)],
+			["NormalFloat", formatTokens(total.tokens).replace(/ tok$/, "").padStart(11)],
+			["String", (total.cost === undefined ? "—" : formatCost(total.cost)).padStart(10)],
+		]);
+		lines.push([]);
+		lines.push([["Comment", "Costs are as each engine reports them. Claude Code prices its"]]);
+		lines.push([["Comment", "tokens at API rates, even on a subscription."]]);
+		if (total.unpriced) lines.push([["Comment", "Codex reports no price (—); its tokens are counted."]]);
+		this.openFloat("Usage", lines, Math.min(72, this.terminal.columns - 4), {
 			selectable: rows,
 			onSelect: (lineIdx) => this.focusSession(rows.indexOf(lineIdx)),
 			initial: rows[this.focusIdx],
@@ -1720,6 +2059,50 @@ export class App implements Component {
 	}
 
 	/** `:diff`: what the focused agent changed since its worktree was created. */
+	/** `:review`: keep or drop the focused agent's changes hunk by hunk. */
+	private openReview() {
+		const s = this.focusedSession;
+		const wt = s?.worktree;
+		if (!s || !wt?.path) {
+			this.setMessage(s ? `'${s.name}' has no worktree to review` : "no agent", "ErrorMsg");
+			return;
+		}
+		if (s.state === "running") {
+			this.setMessage(`'${s.name}' is still working; review it when it's done (or :pause it)`, "WarningMsg");
+			return;
+		}
+		const load = async () => parseDiff(await diffText(wt, Number.POSITIVE_INFINITY));
+		load()
+			.then((files) => {
+				if (files.length === 0) {
+					this.setMessage(`no changes on ${wt.branch} yet`, "Comment");
+					this.tui.requestRender();
+					return;
+				}
+				this.seq.reset();
+				let handle: { hide(): void } | undefined;
+				const after = async () => {
+					s.refreshStat(0);
+					return load();
+				};
+				const review = new HunkReview(this.painter, PICKER_ICONS[this.ui.icons], `Review ${wt.branch} vs ${wt.base ?? "base"}`, files, () => this.terminal.rows - 2, {
+					drop: (patch) => dropPatch(wt.path!, patch).then(after),
+					restore: (patch) => restorePatch(wt.path!, patch).then(after),
+					close: () => {
+						handle?.hide();
+						this.repaint();
+					},
+					requestRender: () => this.tui.requestRender(),
+				});
+				handle = this.tui.showOverlay(review, { width: this.terminal.columns - 4, anchor: "center" });
+				this.tui.requestRender();
+			})
+			.catch((err) => {
+				this.setMessage(`git diff failed: ${(err as Error).message.split("\n")[0]}`, "ErrorMsg");
+				this.tui.requestRender();
+			});
+	}
+
 	private openDiff(split = false) {
 		const s = this.focusedSession;
 		const wt = s?.worktree;
@@ -2130,6 +2513,9 @@ export class App implements Component {
 			case "c":
 				this.openHealth();
 				return true;
+			case "T":
+				this.openTemplatePicker();
+				return true;
 			case "?":
 				this.openHelp();
 				return true;
@@ -2202,7 +2588,8 @@ export class App implements Component {
 		const left = s ? ` ${this.icons.open_agent} ${s.name}` : ` ${this.icons.open_agent} [no agent]`;
 		const model = s ? `  ${s.engine !== "pi" && s.model !== ENGINE_NAMES[s.engine] ? `${ENGINE_NAMES[s.engine]} · ` : ""}${s.model}${s.effort ? ` · ${s.effort}` : ""}` : "";
 		const where = s?.worktree?.path ? `${this.shortPath(s.worktree.path)}${s.worktree.riftri ? " · riftri" : ""}` : s ? "this checkout" : "";
-		const status = s?.state === "paused" ? "  paused" : s?.queue.length ? `  ${this.icons.queued}${s.queue.length} queued` : "";
+		const ext = s && "extensionStatus" in s ? [...(s as PiSession).extensionStatus.values()].join(" · ") : "";
+		const status = (s?.state === "paused" ? "  paused" : s?.queue.length ? `  ${this.icons.queued}${s.queue.length} queued` : "") + (ext ? `  ${ext}` : "");
 		// the path gives way first (from its start: the end names the worktree), always two spaces before it
 		const pathRoom = w - visibleWidth(left) - visibleWidth(model) - visibleWidth(status) - 3;
 		const shownWhere = !where ? "" : visibleWidth(where) <= pathRoom ? where : pathRoom > 4 ? `…${where.slice(where.length - pathRoom + 1)}` : "";
@@ -2337,6 +2724,7 @@ export class App implements Component {
 						[glyphGroup, `${glyph} `],
 						[focused ? "Title" : "VigentSidebar", s.name],
 						["Comment", s.queue.length > 0 ? ` ${I.queued}${s.queue.length}` : ""],
+						[s.state === "error" ? "ErrorMsg" : "WarningMsg", this.unread.has(s) ? ` ${I.unread}` : ""],
 					],
 					rowBg,
 				),
@@ -2382,7 +2770,7 @@ export class App implements Component {
 						? e.id === def
 							? "default"
 							: ""
-						: e.id === "pi"
+						: e.id === "pi" && e.installed
 							? "no API key"
 							: e.installed
 								? (e.connect ?? "not signed in")
@@ -2433,7 +2821,14 @@ export class App implements Component {
 				case "user": {
 					push("", "");
 					wrapTextWithAnsi(item.text, paneW - 2).forEach((l, i) => {
-						push(P.p("VigentUser", I.prompt) + P.s("Normal") + P.p("Keyword", l), I.prompt + stripAnsi(l), {
+						const painted = l
+							.replace(MENTION, (m) => `\0${m}\0`)
+							.split("\0")
+							.map((part, i) => (!part ? "" : P.p(i % 2 ? "VigentMention" : "Keyword", part)))
+							.join("");
+						// the ❯ marks where a prompt starts; its other lines hang under it
+						const lead = i === 0 ? I.prompt : " ".repeat(visibleWidth(I.prompt));
+						push(P.p("VigentUser", lead) + P.s("Normal") + painted, lead + stripAnsi(l), {
 							item: n,
 							start: i === 0,
 						});
@@ -2494,7 +2889,7 @@ export class App implements Component {
 		const changes = st && (st.added || st.removed) ? ` +${st.added} ${this.icons.minus}${st.removed}` : "";
 		const worktree = s?.worktree ? `${this.icons.worktree}${s.worktree.branch}${changes} ` : "";
 		const right = s
-			? ` ${s.model}  ${formatTokens(s.tokens)}  ${running}/${this.sessions.length}${running > 0 ? ` ${this.spinner()}` : ""} `
+			? ` ${s.model}  ${formatUsage(s)}  ${running}/${this.sessions.length}${running > 0 ? ` ${this.spinner()}` : ""} `
 			: "";
 		const plainLen = visibleWidth(` ${this.mode} `) + (this.demo ? 6 : 0) + visibleWidth(leftText) + visibleWidth(worktree) + visibleWidth(right);
 		const fill = Math.max(0, width - plainLen);
@@ -2613,14 +3008,18 @@ function describeRhs(rhs: Rhs[]): string {
 
 const EX_HELP: [string, string][] = [
 	[":new [task]", "start an agent in its own worktree"],
+	[":new -t <template> <task>", "start one from a template and send it (:templates picks)"],
 	[":kill  /  :kill!", "stop the agent (keep / remove its worktree)"],
 	[":new! [name]", "agent in this checkout, no worktree"],
 	[":diff  /  :diff split", "the agent's changes, unified / side by side (s switches)"],
+	[":review", "keep or drop the agent's changes hunk by hunk"],
 	[":merge [--no-squash]", "squash-merge the agent's branch into yours"],
 	[":pr", "push the branch and open a pull request"],
 	[":queue <prompt>", "send after the current run (:queue lists)"],
 	[":pause  /  :resume", "hold the agent and its queue / continue"],
 	[":dash", "all agents at a glance"],
+	[":cost", "tokens and money each agent has used, and the total"],
+	[":pi", "a pi agent's extensions, commands, skills and prompt templates"],
 	[":tree", "the conversation's branches; go back and branch"],
 	[":new [task] --engine claude", "run the agent with Claude Code, codex, opencode or pi"],
 	[":checkhealth", "which engines are installed and signed in"],
@@ -2673,9 +3072,35 @@ function describeAttr(a: Attr): string {
 	return parts.join(" ") || "cleared";
 }
 
-function formatTokens(n: number): string {
+export function formatTokens(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M tok`;
 	if (n >= 1000) return `${(n / 1000).toFixed(1)}k tok`;
 	return `${n} tok`;
+}
+
+/** US dollars: cents, or a tenth of a cent below one cent */
+export function formatCost(usd: number): string {
+	if (usd > 0 && usd < 0.01) return `$${usd.toFixed(3)}`;
+	return `$${usd.toFixed(2)}`;
+}
+
+/** "12.4k tok · $0.31", or just the tokens when the engine reports no price */
+export function formatUsage(u: { tokens: number; cost?: number }): string {
+	return u.cost === undefined ? formatTokens(u.tokens) : `${formatTokens(u.tokens)} · ${formatCost(u.cost)}`;
+}
+
+/** every agent's usage added up; cost counts the agents that report one */
+export function totalUsage(sessions: { tokens: number; cost?: number }[]): { tokens: number; cost?: number; unpriced: number } {
+	let tokens = 0;
+	let cost: number | undefined;
+	let unpriced = 0;
+	for (const s of sessions) {
+		tokens += s.tokens;
+		if (s.cost === undefined) {
+			if (s.tokens) unpriced++;
+		} else cost = (cost ?? 0) + s.cost;
+	}
+	return { tokens, cost, unpriced };
 }
 
 /** A short agent name from a prompt: its first words, without punctuation ("Fix the flaky checkout test, please" -> "fix the flaky checkout test"). */
@@ -2706,6 +3131,7 @@ const LOGO = [
 const DASHBOARD: [string, string, string, string][] = [
 	["i", "✎", "New agent: type a task, Enter", NERD.pencil],
 	["n", "+", "New agent by name", NERD.plus],
+	["T", "▤", "New agent from a template", NERD.fileText],
 	["t", "◐", "Theme", NERD.palette],
 	["s", "⚙", "Settings", NERD.gear],
 	["m", "◆", "Model", NERD.chip],

@@ -138,6 +138,8 @@ test("first run: i, a task, Enter starts an agent on Claude Code in its own work
 		const third = calls()[2].args;
 		assert.deepEqual(third.slice(third.indexOf("--model"), third.indexOf("--model") + 4), ["--model", "opus", "--effort", "high"]);
 		await t.waitFor(/│ done\s*$/m);
+		// three runs at $0.251577 each, as Claude Code reported them
+		await t.waitFor(/tok · \$0\.75 /);
 
 		await t.ex("q");
 		assert.equal(await t.exited, 0);
@@ -151,6 +153,7 @@ test("first run: i, a task, Enter starts an agent on Claude Code in its own work
 		await again.waitFor(/reopened 1 agent from last time/);
 		await again.waitFor(/write hello file/);
 		await again.waitFor(/continuing the Claude Code conversation 3b248a3e/);
+		await again.waitFor(/tok · \$0\.75 /); // the totals came back too
 		await again.ex("q");
 		assert.equal(await again.exited, 0);
 	} finally {
@@ -166,6 +169,36 @@ test("first run: i, a task, Enter starts an agent on Claude Code in its own work
 		assert.equal(await fromOutside.exited, 0);
 	} finally {
 		fromOutside.kill();
+	}
+});
+
+test("@ in a prompt: pick a file in a real terminal, and Claude Code gets the @path", { skip, timeout: 60000 }, async () => {
+	const repo2 = path.join(tmp, "shop2");
+	fs.mkdirSync(path.join(repo2, "src"), { recursive: true });
+	git(["init", "-q", "-b", "main"], repo2);
+	fs.writeFileSync(path.join(repo2, "src", "cart.js"), "export const total = () => 0;\n");
+	fs.writeFileSync(path.join(repo2, "README.md"), "# shop\n");
+	execFileSync("git", ["add", "-A"], { cwd: repo2 });
+	execFileSync("git", ["commit", "-qm", "init"], { cwd: repo2, env: { ...process.env, ...env } });
+	const before = fs.existsSync(claudeLog) ? fs.readFileSync(claudeLog, "utf8").trim().split("\n").length : 0;
+	const t = new Tty([], { cwd: repo2, env });
+	try {
+		await t.waitFor(/● Claude Code +default/);
+		await t.type("i");
+		await t.type("why is ");
+		await t.type("@");
+		await t.waitFor("Attach a file · shop2");
+		await t.waitFor("src/cart.js");
+		await t.type("cart");
+		await t.waitFor(/1\/1 · type to filter/);
+		await t.type("\r");
+		await t.waitFor("❯ why is @src/cart.js");
+		await t.type("zero?\r");
+		await t.waitFor(/│ done\s*$/m);
+		const calls = fs.readFileSync(claudeLog, "utf8").trim().split("\n").map(JSON.parse).slice(before);
+		assert.equal(calls.at(-1).args.at(-1), "why is @src/cart.js zero?", "Claude Code reads @path itself");
+	} finally {
+		t.kill();
 	}
 });
 
@@ -207,4 +240,14 @@ test("the packed npm package installs and runs as `vigent`", { skip: skip || (!o
 	assert.equal(execFileSync(vigent, ["--version"], { env, encoding: "utf8" }).trim(), `vigent ${pkg.version}`, "no commit: it's not a clone");
 	assert.match(execFileSync(vigent, ["theme", "list"], { env, encoding: "utf8" }), /^lazyvim\b/m);
 	assert.match(execFileSync(vigent, ["--help"], { env, encoding: "utf8" }), /engines \(what runs new agents/);
+
+	// the light install, for Claude Code / Codex / OpenCode only: no pi engine, a few MB
+	// (npm ignores --omit=optional with -g, so it goes in a folder of its own, as the README says)
+	const light = path.join(tmp, "light");
+	execFileSync("npm", ["install", "--prefix", light, "--omit=optional", "--no-audit", "--no-fund", path.join(out, tgz)], { stdio: "ignore" });
+	const lib = path.join(light, "node_modules");
+	assert.ok(!fs.existsSync(path.join(lib, "@mariozechner", "pi-coding-agent")), "no pi engine");
+	const size = (dir) => fs.readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? size(path.join(dir, e.name)) : e.isFile() ? fs.statSync(path.join(dir, e.name)).size : 0), 0);
+	assert.ok(size(lib) < 15 * 1024 * 1024, `light install is ${(size(lib) / 1024 / 1024).toFixed(1)} MB`);
+	assert.equal(execFileSync(path.join(lib, ".bin", "vigent"), ["--version"], { env, encoding: "utf8" }).trim(), `vigent ${pkg.version}`);
 });

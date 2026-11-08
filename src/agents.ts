@@ -29,6 +29,8 @@ export interface AgentMeta {
 	requestedModel?: string;
 	/** reasoning effort / thinking level (missing = the engine's default) */
 	effort?: string;
+	/** what a CLI agent has used so far (pi keeps its own, in its session history) */
+	usage?: { tokens: number; cost?: number };
 }
 
 /** vigent's folder in git's per-worktree admin dir. */
@@ -85,4 +87,42 @@ export function restorableAgents(root: string, config: WorktreeConfig): Restorab
 		out.push({ meta, worktree: { branch: w.branch, path: w.path, base: meta.base } });
 	}
 	return out.sort((a, b) => a.meta.createdAt.localeCompare(b.meta.createdAt));
+}
+
+export interface ReopenResult {
+	agents: (RestorableAgent & { backend?: string })[];
+	/** riftri views that can't be used yet, with riftri's reason */
+	blocked: { path: string; reason: string }[];
+}
+
+/**
+ * Agents to reopen at startup, with riftri's views made ready first.
+ *
+ * An OverlayFS view loses its mount when the machine restarts: its folder is
+ * then empty, so the agent's record (kept through the worktree's .git) can't
+ * be read until riftri has repaired it. So every vigent worktree is inspected
+ * (and repaired) before any record is read.
+ */
+export function reopenableAgents(
+	root: string,
+	config: WorktreeConfig,
+	prepare: (root: string, paths: string[]) => Map<string, { ready: boolean; backend?: string; reason?: string }>,
+): ReopenResult {
+	const listed = listWorktrees(root, config).filter((w) => w.branch);
+	const views = prepare(root, listed.map((w) => w.path));
+	const blocked: ReopenResult["blocked"] = [];
+	const agents: ReopenResult["agents"] = [];
+	for (const w of listed) {
+		const view = views.get(w.path);
+		if (view && !view.ready) {
+			blocked.push({ path: w.path, reason: view.reason ?? "not ready" });
+			continue;
+		}
+		if (!fs.existsSync(w.path)) continue;
+		const meta = loadAgentMeta(w.path);
+		if (!meta || meta.detached) continue;
+		agents.push({ meta, worktree: { branch: w.branch!, path: w.path, base: meta.base }, backend: view?.backend });
+	}
+	agents.sort((a, b) => a.meta.createdAt.localeCompare(b.meta.createdAt));
+	return { agents, blocked };
 }

@@ -93,6 +93,7 @@ Each option can also be changed while vigent runs, with vim's `:set` syntax: `:s
 | `icons` | `"unicode"` | `"ascii"` swaps every glyph for plain ASCII |
 | `timeoutlen` | `1000` | ms to wait for the next key of a mapping (vim's `'timeoutlen'`, alias `tm`) |
 | `termguicolors` | `true` (`false` in macOS Terminal.app) | 24-bit color, as in vim. Turn it off on terminals without it, and every color is mapped to the nearest of the 256 standard ones (alias `tgc`) |
+| `notify` | `"auto"` | when an agent finishes, fails or needs you while you're looking at another one (or another window): `"auto"` rings the bell and, in terminals that show one (iTerm2, WezTerm, Ghostty, kitty; also inside tmux), sends a desktop notification. `"bell"`, `"desktop"` or `"off"` choose. The agent gets a mark in the sidebar until you open it |
 | `whichkey` | `true` | after `<leader>` (or any key that starts mappings), pause and a panel lists what each next key does, like which-key.nvim. `Esc` closes it (alias `wk`) |
 | `transparent` | `"auto"` | draw on the terminal's own background, so its blur, opacity or wallpaper shows through. `"auto"` does what the theme says (`lazyvim` is transparent); `true` or `false` forces it for every theme. Live: `:set transparent`, `:set notransparent`, `:set transparent!`, and `:set transparent&` back to `"auto"` |
 
@@ -196,6 +197,31 @@ Type to filter. Enter on text that matches nothing uses the typed name as-is.
 Both apply from the agent's next prompt, show in the winbar (`claude-fable-5 · high`), and are saved with the agent, so they survive a restart. With no agent open, they set the model and effort for new agents. Those are also in `:settings`. `:model <name>` and `:effort <level>` skip the picker.
 
 `claude -p` can't stop and ask before a tool runs, so with the default `acceptEdits` Claude Code may edit files in the worktree, and other tools follow the permission rules in your Claude Code settings. Use `"--permission-mode", "bypassPermissions"` only where the agent is sandboxed.
+
+## `[templates]`
+
+A template is a prompt you start agents with often. `:new -t <name> <task>` starts an agent on the template's engine, model and effort, and sends it the prompt with `{task}` replaced by your task. A prompt without `{task}` gets the task added after it. `:templates` (`Space T`, or `T` on the start screen) opens a picker. Pick a template there and type the task on the command line.
+
+```toml
+[templates.migrate]
+description = "a database migration, with a rollback"   # shown in the picker
+prompt = "Write a migration that {task}. Include the rollback, and test both."
+engine = "claude"     # optional: pi, claude, codex, opencode (default: the usual engine)
+model = "opus"        # optional
+effort = "high"       # optional; checked against the engine's levels
+worktree = true       # optional; false runs it in your checkout
+```
+
+Four are built in. A template of yours with the same name replaces it.
+
+| Template | What the agent is told |
+|---|---|
+| `fix` | find and fix the bug: reproduce it with a failing test first, make the smallest change, run the suite |
+| `test` | write tests in the project's style, run them, and report bugs instead of changing the code |
+| `review` | review this branch's work for bugs, missing tests and unclear code, without changing files; the task (optional) is what to focus on |
+| `explain` | explain how something works and where it lives, without changing files |
+
+What you type wins: `:new -t migrate --engine codex <task>` runs on Codex, without the template's model and effort.
 
 ## `[keys]`
 
@@ -344,6 +370,8 @@ Like vim, every mapping is non-recursive, so `:nmap` behaves like `:nnoremap`. C
 | `<leader>D` | `:dash` |
 | `<leader>u` | `session.tree` (like an undo tree, for the conversation) |
 | `<leader>s` | `:settings<CR>` (theme, look, engine, worktrees and keys in one float) |
+| `<leader>r` | `:review<CR>` (keep or drop the agent's changes hunk by hunk) |
+| `<leader>T` | `:templates<CR>` (start an agent from a template) |
 | `<leader>M` | `:model<CR>` (pick the focused agent's model) |
 | `<leader>e` | `:effort<CR>` (pick its reasoning effort) |
 | `<leader>E` | `:engine<CR>` (pick the engine new agents run on) |
@@ -369,3 +397,4 @@ Like vim, every mapping is non-recursive, so `:nmap` behaves like `:nnoremap`. C
 | `<BS>` `<C-h>` | `edit.backspace` (on an empty command line, leaves it) |
 | `<C-w>` | `edit.delete_word` |
 | `<C-u>` | `edit.clear` |
+| `@` | in INSERT, at the start of a word: pick a file to attach (`Esc` keeps a plain `@`) |

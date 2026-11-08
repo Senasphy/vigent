@@ -6,6 +6,9 @@
  * - DemoSession replays a scripted transcript so the UI can be explored
  *   without API keys.
  */
+import { expandPrompt } from "./attach.js";
+import { loadPiAi, loadPiSdk } from "./pi-sdk.js";
+import { extensionUi, type PiResources, piResources, type PiUiHost } from "./pi-ui.js";
 import type { EngineId } from "./engines.js";
 import { flattenTree, type TreeGlyphs, type TreeRow } from "./tree.js";
 import { diffStat, type WorktreeInfo } from "./worktree.js";
@@ -45,6 +48,8 @@ export abstract class Session {
 	state: SessionState = "idle";
 	items: TranscriptItem[] = [];
 	tokens = 0;
+	/** money spent, in US dollars, as the engine reports it; undefined = the engine doesn't say (Codex) */
+	cost?: number;
 	version = 0; // bumped on every change, used for render caching
 	private listeners = new Set<() => void>();
 
@@ -315,7 +320,7 @@ export class PiSession extends Session {
 	}
 
 	private async init() {
-		const sdk = await import("@mariozechner/pi-coding-agent");
+		const sdk = await loadPiSdk();
 		const sessionManager = this.opts.sessionDir
 			? sdk.SessionManager.continueRecent(this.cwd, this.opts.sessionDir)
 			: sdk.SessionManager.inMemory();
@@ -334,10 +339,12 @@ export class PiSession extends Session {
 			...(this.opts.agentDir ? { agentDir: this.opts.agentDir } : {}),
 		});
 		this.session = session;
+		await this.bindExtensions(sdk, session);
 		if (resuming) {
 			const restored = itemsFromMessages(session.messages ?? []);
 			this.items.push(...restored.items);
 			this.tokens += restored.tokens;
+			if (restored.cost !== undefined) this.cost = (this.cost ?? 0) + restored.cost;
 			this.pushInfo(`resumed: ${restored.items.filter((i) => i.kind === "user").length} earlier prompts`);
 			this.refreshStat(0);
 		}
@@ -378,7 +385,10 @@ export class PiSession extends Session {
 					if (event.message?.content) last.text = extractText(event.message.content);
 					last.streaming = false;
 					const usage = event.message?.usage;
-					if (usage) this.tokens += (usage.input ?? 0) + (usage.output ?? 0);
+					if (usage) {
+						this.tokens += usageTokens(usage);
+						if (typeof usage.cost?.total === "number") this.cost = (this.cost ?? 0) + usage.cost.total;
+					}
 					if (!last.text) this.items.pop(); // a turn that only called tools
 					this.emit();
 				}
@@ -447,13 +457,86 @@ export class PiSession extends Session {
 		return { editorText: r.editorText };
 	}
 
+	/** where this agent's extensions show dialogs and messages (set by the app) */
+	uiHost?: PiUiHost;
+	/** statuses extensions keep up to date (ctx.ui.setStatus), shown in the winbar */
+	extensionStatus = new Map<string, string>();
+
+	/**
+	 * Hand pi's extensions their UI and start them (session_start), as pi's
+	 * own modes do. Without this, an extension's confirm() always answers no
+	 * and its notify() goes nowhere.
+	 */
+	private async bindExtensions(sdk: any, session: any) {
+		const THEME = Symbol.for("@mariozechner/pi-coding-agent:theme");
+		try {
+			if (!(globalThis as any)[THEME]) sdk.initTheme?.(undefined, false);
+		} catch {
+			// extensions that style text get plain text
+		}
+		const ui = extensionUi(
+			() => this.uiHost ?? this.fallbackUi,
+			() => (globalThis as any)[THEME],
+		);
+		try {
+			await session.bindExtensions({
+				uiContext: ui,
+				commandContextActions: {
+					waitForIdle: () => session.agent.waitForIdle(),
+					// one conversation per agent in vigent: :new starts another agent
+					newSession: async () => ({ cancelled: true }),
+					fork: async () => ({ cancelled: true }),
+					switchSession: async () => ({ cancelled: true }),
+					navigateTree: async (targetId: string) => {
+						const r = await session.navigateTree(targetId, {});
+						return { cancelled: r.cancelled };
+					},
+					reload: async () => {
+						await session.reload();
+					},
+				},
+				onError: (err: any) => this.pushInfo(`extension error (${shortExtPath(err?.extensionPath)}${err?.event ? `, ${err.event}` : ""}): ${err?.error ?? err}`),
+			});
+		} catch (err: any) {
+			this.pushInfo(`pi extensions didn't start: ${String(err?.message ?? err)}`);
+		}
+		const failed = piResources(session).extensions.filter((e) => e.error);
+		for (const e of failed) this.pushInfo(`extension ${shortExtPath(e.path)} didn't load: ${e.error}`);
+	}
+
+	/** with no screen to ask on: messages still reach the transcript, dialogs answer no */
+	private fallbackUi: PiUiHost = {
+		select: async () => undefined,
+		confirm: async () => false,
+		input: async () => undefined,
+		notify: (message) => this.pushInfo(message),
+		setStatus: (key, text) => this.setExtensionStatus(key, text),
+	};
+
+	setExtensionStatus(key: string, text: string | undefined) {
+		if (text) this.extensionStatus.set(key, text);
+		else this.extensionStatus.delete(key);
+		this.emit();
+	}
+
+	/** What pi loaded for this agent: extensions, their commands, skills, prompt templates, AGENTS.md files. */
+	resources(): PiResources | undefined {
+		return this.session ? piResources(this.session) : undefined;
+	}
+
 	send(text: string): void {
 		this.pushUser(text);
 		this.setState("running");
+		const attached = expandPrompt(text, "pi", this.cwd);
+		if (attached.skipped.length) this.pushInfo(`not attached: ${attached.skipped.join(", ")}`);
 		this.ready
 			// pi reports agent_end a moment before it accepts the next prompt (queued prompts hit this)
 			.then(() => this.session.agent?.waitForIdle?.())
-			.then(() => this.session.prompt(text))
+			.then(() => this.session.prompt(attached.prompt))
+			// an extension command (/name) or a handled input runs no turn: nothing else will end it
+			.then(() => {
+				if (this.state === "running") this.setState("idle");
+			})
 			.catch((err: any) => {
 				const text = String(err?.message ?? err);
 				// pi's own advice (/login, its docs paths) is for pi's TUI, not vigent: keep its first line
@@ -476,10 +559,11 @@ export class PiSession extends Session {
 }
 
 /** Rebuild the transcript from pi's saved messages: prompts, replies, and tool calls with their output. */
-export function itemsFromMessages(messages: any[]): { items: TranscriptItem[]; tokens: number } {
+export function itemsFromMessages(messages: any[]): { items: TranscriptItem[]; tokens: number; cost?: number } {
 	const items: TranscriptItem[] = [];
 	const byCallId = new Map<string, TranscriptItem>();
 	let tokens = 0;
+	let cost: number | undefined;
 	for (const m of messages) {
 		if (m?.role === "user") {
 			const text = extractText(m.content);
@@ -498,7 +582,10 @@ export function itemsFromMessages(messages: any[]): { items: TranscriptItem[]; t
 				items.push(item);
 				if (b.id) byCallId.set(b.id, item);
 			}
-			if (m.usage) tokens += (m.usage.input ?? 0) + (m.usage.output ?? 0);
+			if (m.usage) {
+				tokens += usageTokens(m.usage);
+				if (typeof m.usage.cost?.total === "number") cost = (cost ?? 0) + m.usage.cost.total;
+			}
 			const err = piError(m);
 			if (err) items.push({ kind: "info", text: err });
 		} else if (m?.role === "toolResult") {
@@ -506,7 +593,12 @@ export function itemsFromMessages(messages: any[]): { items: TranscriptItem[]; t
 			if (item?.tool) item.tool.output = extractText(m.content);
 		}
 	}
-	return { items, tokens };
+	return { items, tokens, cost };
+}
+
+/** pi's usage: every token the request read or wrote, cached ones included (like Claude Code's count) */
+function usageTokens(u: any): number {
+	return u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
 }
 
 /** What to do when pi can't get through: this agent stays on pi, so start one elsewhere. */
@@ -542,7 +634,7 @@ function summarizeArgs(args: any): string {
 
 /** A pi-ai model from "provider/model", or a bare id (Anthropic's). Undefined when pi doesn't know it. */
 export async function piModel(id: string): Promise<unknown> {
-	const ai: any = await import("@mariozechner/pi-ai");
+	const ai: any = await loadPiAi();
 	const slash = id.indexOf("/");
 	const [provider, modelId] = slash > 0 ? [id.slice(0, slash), id.slice(slash + 1)] : ["anthropic", id];
 	try {
@@ -550,4 +642,10 @@ export async function piModel(id: string): Promise<unknown> {
 	} catch {
 		return undefined;
 	}
+}
+
+/** ~/.pi/agent/extensions/guard.ts → extensions/guard.ts */
+function shortExtPath(p: unknown): string {
+	const parts = String(p ?? "extension").split(/[\\/]/);
+	return parts.slice(-2).join("/");
 }

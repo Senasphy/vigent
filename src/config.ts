@@ -15,10 +15,12 @@
  *   CursorLine = "guibg=#2a2f3a"
  *   VigentSidebar = { link = "NormalFloat" }
  */
+import { NOTIFY_MODES, type NotifyMode } from "./notify.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { EFFORTS } from "./choices.js";
+import { parseTemplates, type Template } from "./templates.js";
 import { ICON_SETS, type IconSet } from "./icons.js";
 import { type EngineId, isEngineId } from "./engines.js";
 import { WORKTREE_BACKENDS, type WorktreeBackend } from "./riftri.js";
@@ -40,6 +42,8 @@ export interface UiOptions {
 	transparent: boolean | "auto";
 	/** after <leader> (or any key that starts mappings), show what can follow, like which-key.nvim */
 	whichkey: boolean;
+	/** when an agent finishes while you look elsewhere: "auto" (bell, plus a desktop notification where the terminal shows one), "bell", "desktop", "off" */
+	notify: NotifyMode;
 }
 
 /** [engines.claude] / [engines.codex] / [engines.opencode] */
@@ -64,6 +68,8 @@ export interface Config {
 	/** raw mappings per mode; validated when the keymap is built */
 	keys: Partial<Record<KeyMode, Record<string, unknown>>>;
 	worktree: WorktreeConfig;
+	/** [templates.<name>]: prompts to start agents with (:new -t <name>) */
+	templates: Record<string, Template>;
 }
 
 export const DEFAULT_UI: UiOptions = {
@@ -77,6 +83,7 @@ export const DEFAULT_UI: UiOptions = {
 	termguicolors: process.env.TERM_PROGRAM !== "Apple_Terminal",
 	transparent: "auto",
 	whichkey: true,
+	notify: "auto",
 };
 
 export function configPath(): string {
@@ -85,7 +92,7 @@ export function configPath(): string {
 
 /** Load the config file. Problems become warnings so a typo never stops vigent from starting. */
 export function loadConfig(file = configPath()): { config: Config; warnings: string[] } {
-	const config: Config = { ui: { ...DEFAULT_UI }, highlights: {}, keys: {}, worktree: { ...DEFAULT_WORKTREE }, engines: {} };
+	const config: Config = { ui: { ...DEFAULT_UI }, highlights: {}, keys: {}, worktree: { ...DEFAULT_WORKTREE }, engines: {}, templates: {} };
 	const warnings: string[] = [];
 	if (!fs.existsSync(file)) return { config, warnings };
 
@@ -137,6 +144,9 @@ export function loadConfig(file = configPath()): { config: Config; warnings: str
 					}
 					config.engines[id as EngineId] = e;
 				}
+				break;
+			case "templates":
+				config.templates = parseTemplates(value, warnings);
 				break;
 			case "keys":
 				if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -226,6 +236,7 @@ const ALIASES: Record<string, keyof UiOptions> = {
 	transp: "transparent",
 	whichkey: "whichkey",
 	wk: "whichkey",
+	notify: "notify",
 };
 
 /** Set one option from a config value. Returns an error message, or undefined on success. */
@@ -247,6 +258,10 @@ export function setOption(ui: UiOptions, name: string, value: unknown): string |
 			ui.sidebar_width = n;
 			return;
 		}
+		case "notify":
+			if (!NOTIFY_MODES.includes(value as NotifyMode)) return `'${name}' should be "auto", "bell", "desktop" or "off"`;
+			ui.notify = value as NotifyMode;
+			return;
 		case "icons":
 			if (!ICON_SETS.includes(value as IconSet)) return `'${name}' should be "unicode", "nerd" or "ascii"`;
 			ui.icons = value as IconSet;
@@ -359,6 +374,17 @@ engine = "auto"
 # [engines.opencode]
 # model = "anthropic/claude-sonnet-4-5"
 
+# --- Templates -------------------------------------------------------------
+# Prompts you start agents with often. :new -t fix <task> starts an agent and
+# sends the prompt, {task} replaced by what you typed; :templates picks one.
+# Built in: fix, test, review, explain (one of yours with the same name
+# replaces it). engine, model, effort and worktree are optional.
+# [templates.migrate]
+# description = "a database migration, with a rollback"
+# prompt = "Write a migration that {task}. Include the rollback, and test both."
+# engine = "claude"
+# effort = "high"
+
 # --- Leader ----------------------------------------------------------------
 # What <leader> means in [keys]. Vim's default is "\\".
 leader = "<Space>"
@@ -374,6 +400,7 @@ timeoutlen = 1000      # ms to wait for the rest of a multi-key mapping
 # termguicolors = false  # for terminals without 24-bit color: use the nearest of 256
 # transparent = true    # use the terminal's background with any theme ("auto": the theme decides)
 whichkey = true          # after <leader>, show what each next key does (like which-key.nvim)
+notify = "auto"          # an agent finished while you looked elsewhere: "auto", "bell", "desktop", "off"
 
 # --- Colors (also live: :hi Group guifg=#... guibg=#...) -------------------
 # Applied on top of whichever theme is active. A value is a table, a vim

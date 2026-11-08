@@ -3,9 +3,10 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ProcessTerminal, TUI } from "@mariozechner/pi-tui";
-import { type AgentMeta, loadAgentMeta, restorableAgents, saveAgentMeta, sessionDir } from "./agents.js";
+import { ProcessTerminal, TUI } from "./tui.js";
+import { type AgentMeta, loadAgentMeta, reopenableAgents, saveAgentMeta, sessionDir } from "./agents.js";
 import { App } from "./app.js";
+import { FOCUS_REPORTING_OFF, FOCUS_REPORTING_ON } from "./notify.js";
 import { staleBuild, VERSION_TEXT } from "./version.js";
 import { CliSession } from "./cli-engines.js";
 import { defaultEngine, detectEngines, ENGINE_BINS, type EngineId, isEngineId, onPath, piConnected, quickEngines } from "./engines.js";
@@ -328,6 +329,7 @@ async function main(): Promise<number | undefined> {
 		});
 
 	// model and effort for new agents, per engine, from [engines.<id>]
+	app.templates = config.templates;
 	for (const [id, opts] of Object.entries(config.engines)) {
 		if (opts?.model) app.newAgentModel[id as EngineId] = opts.model;
 		if (opts?.effort) app.newAgentEffort[id as EngineId] = opts.effort;
@@ -342,7 +344,7 @@ async function main(): Promise<number | undefined> {
 		saveAgentMeta(wt, {
 			...meta,
 			model: s instanceof CliSession ? (requested ?? "") : s.model,
-			...(s instanceof CliSession ? { requestedModel: requested } : {}),
+			...(s instanceof CliSession ? { requestedModel: requested, usage: { tokens: s.tokens, ...(s.cost !== undefined ? { cost: s.cost } : {}) } } : {}),
 			effort: s.effort,
 		});
 	};
@@ -375,7 +377,13 @@ async function main(): Promise<number | undefined> {
 	/** Reopen a saved agent with the engine it was started with. */
 	const reopen = (meta: AgentMeta, worktree: WorktreeInfo): Session => {
 		const engine = meta.engine && isEngineId(meta.engine) ? meta.engine : "pi";
-		if (engine !== "pi") return cliSession(meta.name, engine, meta.requestedModel, worktree.path!, worktree, meta.resumeId, meta.effort);
+		if (engine !== "pi") {
+			const s = cliSession(meta.name, engine, meta.requestedModel, worktree.path!, worktree, meta.resumeId, meta.effort);
+			// the CLI keeps the conversation; vigent keeps the running totals
+			s.tokens = meta.usage?.tokens ?? 0;
+			s.cost = meta.usage?.cost;
+			return s;
+		}
 		return new PiSession(meta.name, meta.model, { cwd: worktree.path!, worktree, sessionDir: sessionDir(worktree.path!), effort: meta.effort });
 	};
 	app.attachSession = (wt) => {
@@ -397,6 +405,7 @@ async function main(): Promise<number | undefined> {
 			s.abort();
 			s.dispose();
 		}
+		terminal.write(FOCUS_REPORTING_OFF);
 		tui.stop();
 		process.exit(0);
 	};
@@ -412,17 +421,12 @@ async function main(): Promise<number | undefined> {
 		}
 	} else if (root && config.worktree.enabled) {
 		// reopen the agents that were running when vigent last quit
-		const agents = restorableAgents(root, config.worktree);
-		// riftri views on OverlayFS lose their mount on reboot: repair them before an agent runs there
-		const views = prepareViews(root, agents.map((a) => a.worktree.path!));
-		for (const { meta, worktree } of agents) {
-			const view = views.get(worktree.path!);
-			if (view && !view.ready) {
-				warnings.push(`couldn't reopen '${meta.name}': ${view.reason}`);
-				continue;
-			}
+		// riftri views on OverlayFS lose their mount on reboot: they're repaired before any agent's record is read
+		const { agents, blocked } = reopenableAgents(root, config.worktree, prepareViews);
+		for (const b of blocked) warnings.push(`couldn't reopen the agent in ${b.path}: ${b.reason}`);
+		for (const { meta, worktree, backend } of agents) {
 			try {
-				app.addSession(reopen(meta, { ...worktree, riftri: view?.backend }), false);
+				app.addSession(reopen(meta, { ...worktree, riftri: backend }), false);
 			} catch (err) {
 				warnings.push(`couldn't reopen '${meta.name}': ${(err as Error).message}`);
 			}
@@ -437,6 +441,8 @@ async function main(): Promise<number | undefined> {
 	tui.setFocus(app);
 	terminal.setTitle("vigent");
 	tui.start();
+	// focus reports let a notification skip the agent you're looking at
+	terminal.write(FOCUS_REPORTING_ON);
 	if (warnings.length > 0) app.notify(warnings.join(" · "));
 	if (isFollow(themeName)) {
 		const editor = themeName;

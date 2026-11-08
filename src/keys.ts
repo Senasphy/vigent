@@ -13,7 +13,7 @@
  * Like vim, a key that starts a longer mapping waits `timeoutlen` ms for the
  * rest; that is what makes `jk` = `<Esc>` in insert mode work.
  */
-import { parseKey } from "@mariozechner/pi-tui";
+import { parseKey } from "./tui.js";
 import { didYouMean } from "./suggest.js";
 
 export type KeyMode = "normal" | "insert" | "visual" | "command";
@@ -148,6 +148,8 @@ export const DEFAULT_KEYS: Record<KeyMode, Record<string, string>> = {
 		"<leader>D": ":dash<CR>",
 		"<leader>u": "session.tree",
 		"<leader>s": ":settings<CR>",
+		"<leader>r": ":review<CR>",
+		"<leader>T": ":templates<CR>",
 		"<leader>M": ":model<CR>",
 		"<leader>e": ":effort<CR>",
 		"<leader>E": ":engine<CR>",

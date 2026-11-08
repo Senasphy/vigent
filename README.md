@@ -14,7 +14,16 @@ npm install -g @vigent/cli
 
 The package is `@vigent/cli` (npm doesn't accept the plain name `vigent`, which it finds too close to `vitest`); the command is `vigent`. Run `vigent` in a project, or `vigent <folder>` (`vigent .`, `vigent ~/code/app`) from anywhere.
 
-Requires Node.js 20 or newer and git. Then, inside any git repository:
+If you only run Claude Code, Codex or OpenCode, the light install leaves out the built-in pi engine and its model SDKs. It is 4 MB instead of about 200 MB. npm ignores `--omit=optional` with `-g`, so this installs into a folder of its own:
+
+```bash
+npm install --prefix ~/.vigent --omit=optional @vigent/cli
+ln -s ~/.vigent/node_modules/.bin/vigent ~/.local/bin/vigent   # or put ~/.vigent/node_modules/.bin on PATH
+```
+
+pi then shows as not installed; the same command without `--omit=optional` adds it back. The light install also leaves out the bundled riftri, so worktrees are plain git ones unless riftri is on your PATH.
+
+Requires Node.js 20 or newer and git. On Node 22.1 or newer, vigent keeps Node's compile cache, which makes later starts faster. Then, inside any git repository:
 
 ```bash
 vigent                    # pi with ANTHROPIC_API_KEY (or OPENAI_API_KEY / GEMINI_API_KEY), or a signed-in CLI
@@ -33,9 +42,33 @@ Like LazyVim, vigent opens on a dashboard. Press `i` and type a task, `n` to nam
 
 ![which-key after Space](docs/screenshots/which-key.png)
 
+### While several agents run
+
+When an agent finishes, fails or needs you while you're looking at another one (or at another window), vigent rings the bell. In iTerm2, WezTerm, Ghostty and kitty it also sends a desktop notification, inside tmux too. The message line says which agent and the key to open it, and the agent gets a ◆ in the sidebar until you do. Set `notify` in `[ui]` (or `:settings`) to `"bell"`, `"desktop"` or `"off"`.
+
+![an agent finished in the background](docs/screenshots/notify.png)
+
+The statusline shows what the agent on screen has used, like `74.8k tok · $0.50`, and `:dash` adds up every agent. `:cost` lists each agent with its engine, tokens and cost, and the total. Costs are what each engine reports: Claude Code prices what it used at API rates even on a subscription, OpenCode prices each step, pi uses its model prices, and Codex reports tokens only. CLI agents keep their totals across restarts.
+
+![:cost](docs/screenshots/cost.png)
+
 ### First agent
 
 Inside a git repository, press `i`, type what you want done, and press Enter. An agent starts on it in its own worktree, using the first CLI you're signed in to (Claude Code, Codex, OpenCode), with its own login and settings, or else pi if it has an API key (`:checkhealth` shows which). Watch it work, press `i` again to follow up, and `Esc` to go back to NORMAL mode. `:new <task> --engine codex` starts more agents, and `]s` / `[s` or `1`–`9` switch between them.
+
+### Pointing an agent at files
+
+Type `@` in a prompt and a file picker opens over it with the files in the agent's worktree (what git tracks plus new files, never what `.gitignore` hides). Type to narrow it, `Enter` writes `@src/cart.js`, `Esc` keeps a plain `@`, and `Backspace` takes the `@` back. Each engine gets the files its own way: Claude Code reads `@path` itself, OpenCode gets them with `-f`, and for Codex and pi vigent adds each file's contents under your prompt (text files up to 100 KB; the transcript notes any it left out). The transcript shows what you typed, with the mentions highlighted.
+
+![@ opens a file picker](docs/screenshots/attach-picker.png)
+
+![the prompt with its mentions, and the reply](docs/screenshots/attach-sent.png)
+
+### Templates
+
+For prompts you use often, `:new -t fix the cart total is off by one` starts an agent and sends it the `fix` template with your task filled in. Four are built in: `fix` (failing test first, then the fix), `test`, `review` (changes nothing) and `explain`. `:templates` (`Space T`, or `T` on the start screen) picks one. Add your own under `[templates.<name>]` in config.toml, each with an optional engine, model and effort ([docs/config.md](docs/config.md#templates)).
+
+![:templates](docs/screenshots/templates.png)
 
 ## From source
 
@@ -100,6 +133,16 @@ The sidebar's ENGINES block shows each one: `●` signed in, `◐` installed but
 
 Change the arguments or the model per engine in `[engines.<id>]` ([docs/config.md](https://github.com/farming-labs/vigent/blob/main/docs/config.md#engines)).
 
+### pi extensions, skills and prompt templates
+
+A pi agent loads what pi itself would load. That covers extensions from `~/.pi/agent/extensions/` and `.pi/extensions/`, and the packages you installed with pi. It also covers skills, prompt templates, and the project's `AGENTS.md`.
+
+vigent gives extensions a UI of their own. When an extension asks for confirmation, vigent shows a y/n question in the command line. Choices and text input open pickers. Notifications go to the transcript and the message line, and statuses show in the winbar. Each one names the agent it came from, and a question from an agent you aren't looking at rings the bell. So pi's permission gate works the same as in pi: it asks before an `rm -rf`, and **No** blocks the command.
+
+Type an extension's command (`/deploy`), a skill (`/skill:changelog`) or a prompt template (`/tidy src/cart.js`) as a prompt. **`:pi`** lists everything the focused agent loaded, including extensions that failed and why. Press Enter on a command, skill or prompt template to start a prompt with it.
+
+![a pi extension asking before rm -rf](docs/screenshots/pi-extensions.png)
+
 ## Worktrees
 
 Every agent gets its own git worktree and branch, so agents never touch your checkout or each other's files:
@@ -132,12 +175,17 @@ A worktree is normally a full copy of your checkout, so ten agents on a big repo
 
 ## Reviewing and landing work
 
+**`:review`** (`Space r`) goes through the agent's changes one hunk at a time. That covers its commits, its uncommitted edits and its new files. Press `x` to drop the hunk under the cursor, `X` to drop the whole file, and `u` to undo. Dropping takes the change out of the agent's worktree, so `:merge` and `:pr` land only what you kept.
+
+![:review](docs/screenshots/review.png)
+
 ```vim
 :diff                  " the agent's changes; ]c / [c jump between hunks
 :merge                 " squash-merge its branch into yours: one commit, e.g. "fix: flaky checkout test"
 :merge --no-squash     " a regular merge commit instead
 :pr                    " push the branch and open a pull request (gh), or print the compare URL
 :dash                  " every agent at a glance; j/k and Enter to jump to one
+:cost                  " tokens and money each agent has used, and the total
 :queue <prompt>        " send a follow-up after the current run (:queue alone lists them)
 :pause  /  :resume     " hold an agent and its queue, then continue
 :w [file]              " save the transcript as Markdown

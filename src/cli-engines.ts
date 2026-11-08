@@ -10,6 +10,7 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { expandPrompt } from "./attach.js";
 import { ENGINE_BINS, ENGINE_NAMES, type EngineId } from "./engines.js";
 import { Session, type TranscriptItem } from "./session.js";
 import type { WorktreeInfo } from "./worktree.js";
@@ -26,7 +27,7 @@ export type CliEvent =
 	| { type: "text"; text: string }
 	| { type: "tool"; id?: string; name: string; summary: string }
 	| { type: "tool_result"; id?: string; output: string }
-	| { type: "usage"; tokens: number }
+	| { type: "usage"; tokens: number; cost?: number }
 	| { type: "error"; message: string }
 	| { type: "done"; ok: boolean; error?: string };
 
@@ -39,6 +40,8 @@ export interface CliRunOptions {
 	cwd: string;
 	/** extra arguments from config ([engines.<id>] args) */
 	extraArgs?: string[];
+	/** files attached with `@path` (OpenCode takes them with -f) */
+	files?: string[];
 }
 
 export interface CliAdapter {
@@ -110,7 +113,8 @@ export const claudeAdapter: CliAdapter = {
 					const u = e.usage ?? {};
 					const tokens =
 						(u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.output_tokens ?? 0);
-					if (tokens) out.push({ type: "usage", tokens });
+					const cost = typeof e.total_cost_usd === "number" ? e.total_cost_usd : undefined;
+					if (tokens || cost !== undefined) out.push({ type: "usage", tokens, ...(cost !== undefined ? { cost } : {}) });
 					if (e.session_id) out.push({ type: "session", id: e.session_id });
 					const ok = !e.is_error && e.subtype === "success";
 					out.push({ type: "done", ok, ...(ok ? {} : { error: String(e.result ?? e.errors?.join?.("; ") ?? e.subtype ?? "failed") }) });
@@ -240,6 +244,7 @@ export const opencodeAdapter: CliAdapter = {
 			...(o.model ? ["-m", o.model] : []),
 			...(o.effort ? ["--variant", o.effort] : []),
 			...(o.resumeId ? ["--session", o.resumeId] : []),
+			...(o.files ?? []).flatMap((f) => ["-f", f]),
 			"--",
 			prompt,
 		];
@@ -267,7 +272,8 @@ export const opencodeAdapter: CliAdapter = {
 				case "step_finish": {
 					const t = part.tokens ?? {};
 					const tokens = (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0);
-					if (tokens) out.push({ type: "usage", tokens });
+					const cost = typeof part.cost === "number" ? part.cost : undefined;
+					if (tokens || cost !== undefined) out.push({ type: "usage", tokens, ...(cost !== undefined ? { cost } : {}) });
 					break;
 				}
 				case "error": {
@@ -357,8 +363,11 @@ export class CliSession extends Session {
 		this.pushUser(text);
 		this.setState("running");
 		this.aborted = false;
-		const args = this.adapter.args(text, {
+		const attached = expandPrompt(text, this.adapter.id, this.cwd);
+		if (attached.skipped.length) this.pushInfo(`not attached: ${attached.skipped.join(", ")}`);
+		const args = this.adapter.args(attached.prompt, {
 			cwd: this.cwd,
+			files: attached.files,
 			model: this.requestedModel,
 			effort: this.effort,
 			resumeId: this.resumeId,
@@ -429,6 +438,7 @@ export class CliSession extends Session {
 				}
 				case "usage":
 					this.tokens += ev.tokens;
+					if (ev.cost !== undefined) this.cost = (this.cost ?? 0) + ev.cost;
 					this.emit();
 					break;
 				case "error":
