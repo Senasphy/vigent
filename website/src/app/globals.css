@@ -285,7 +285,7 @@ button.sw:hover, button.sw:focus-visible { border-color: var(--faint); color: va
   .outline a::before { content: "  "; white-space: pre; color: var(--faint); }
   .outline a:hover { color: var(--bright); background: var(--cursorline); }
   .outline a:focus-visible { outline: 1px solid var(--cyan); outline-offset: -1px; color: var(--bright); }
-  .outline a.on { color: var(--cyan); background: #1a1a1d; }
+  .outline a.on { color: var(--cyan); background: var(--on, #1a1a1d); }
   .outline a.on::before { content: "▸ "; color: var(--cyan); }
   .outline dl { margin: 0; padding: 0 1.5ch; }
   .outline dl > div { display: grid; grid-template-columns: 9ch minmax(0, 1fr); column-gap: 1ch; }
