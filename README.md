@@ -2,6 +2,8 @@
 
 A vim-style, lightweight terminal app for running several coding agents at once, built on the [pi](https://github.com/badlogic/pi-mono) engine. It can also drive the Claude Code, Codex and OpenCode CLIs you already have installed, with their own logins.
 
+**Website:** [vigent.farming-labs.dev](https://vigent.farming-labs.dev) · **Docs:** [vigent.farming-labs.dev/docs](https://vigent.farming-labs.dev/docs)
+
 ![vigent with the default Neovim theme](docs/screenshots/vigent-default-theme.png)
 
 ![vigent with the gruvbox theme, second session focused](docs/screenshots/vigent-gruvbox.png)
