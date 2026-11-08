@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { INSTALL, REPO } from "../lib/site";
+import { SitePicker } from "./site-picker";
 
 /** Where `:<command>` goes. */
 const ROUTES: Record<string, string> = {
@@ -90,11 +91,8 @@ export function VimChrome({ file }: { file: string }) {
     yank(picked.join("\n"), picked.length);
   };
 
-  /** Ask the drawing of vigent for its colorscheme picker (on a page without it, go to the one that has it). */
-  const colorscheme = (name?: string) => {
-    if (document.querySelector(".screen")) document.dispatchEvent(new CustomEvent("vigent:colorscheme", { detail: name }));
-    else location.href = "/#top";
-  };
+  /** Ask for the colorscheme picker: the drawing of vigent has it on the home page, SitePicker everywhere else. */
+  const colorscheme = (name?: string) => document.dispatchEvent(new CustomEvent("vigent:colorscheme", { detail: name }));
 
   /** Put the cursor on line `i` (0-based) and keep it on screen. */
   const moveTo = (i: number, scroll = true) => {
@@ -307,6 +305,7 @@ export function VimChrome({ file }: { file: string }) {
 
   return (
     <>
+      <SitePicker />
       {toast && (
         <div className="toast" role="status" aria-live="polite" key={toast.id}>
           {toast.ok ? (
