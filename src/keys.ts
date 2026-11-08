@@ -79,7 +79,7 @@ export const ACTIONS: Record<string, string> = {
 	"session.pause": "pause the agent and hold its queued prompts",
 	"session.resume": "resume a paused agent",
 	"session.tree": "the conversation tree: go back to an earlier point",
-	"sidebar.focus": "move the cursor into the sessions sidebar (j/k pick an agent, Enter or Esc back)",
+	"sidebar.focus": "sessions sidebar: j/k pick an agent, Enter or Esc back",
 	"fold.toggle": "fold / unfold tool output",
 	"fold.open_all": "unfold all tool output",
 	"fold.close_all": "fold all tool output",
