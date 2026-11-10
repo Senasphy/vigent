@@ -38,6 +38,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { setDetached } from "./agents.js";
 import { dropPatch, parseDiff, restorePatch } from "./hunks.js";
+import { isSplit, type Node, type Rect, type Side, type SplitDir, type Win, Windows } from "./windows.js";
 import { HunkReview } from "./hunk-review.js";
 import { listFiles, MENTION, mentionable } from "./attach.js";
 import { allTemplates, fillTemplate, needsTask, type Template } from "./templates.js";
@@ -214,6 +215,33 @@ interface PaneLine {
 	label?: boolean;
 }
 
+/** :wincmd {key}: what <C-w>{key} does */
+const WINCMD: Record<string, string> = {
+	h: "window.left",
+	j: "window.down",
+	k: "window.up",
+	l: "window.right",
+	w: "window.next",
+	W: "window.prev",
+	p: "window.last",
+	t: "window.top",
+	b: "window.bottom",
+	v: "window.vsplit",
+	s: "window.split",
+	c: "window.close",
+	q: "window.quit",
+	o: "window.only",
+	"=": "window.equal",
+	">": "window.wider",
+	"<": "window.narrower",
+	"+": "window.taller",
+	"-": "window.shorter",
+	"|": "window.max_width",
+	_: "window.max_height",
+	x: "window.exchange",
+	r: "window.rotate",
+};
+
 export class App implements Component {
 	mode: Mode = "NORMAL";
 	sessions: Session[] = [];
@@ -241,7 +269,13 @@ export class App implements Component {
 	private spinnerTimer?: ReturnType<typeof setInterval>;
 	private statTimer?: ReturnType<typeof setInterval>;
 
-	private paneCache: { lines: PaneLine[]; key: string } = { lines: [], key: "" };
+	/** per agent and width, so windows side by side don't rebuild each other's lines */
+	private paneCache = new Map<string, { lines: PaneLine[]; key: string }>();
+
+	/** the windows over the transcript; `focusIdx` and `scrollOffset` are the current one's */
+	windows = new Windows<Session>();
+	/** while drawing a window: its place, which sizes are measured against */
+	private drawing?: Rect;
 
 	onQuit: () => void = () => {};
 	/** reopen an agent in an existing worktree (`:attach`) */
@@ -388,15 +422,20 @@ export class App implements Component {
 		if (before === "running" && s.state !== "running") this.persist(s); // its usage totals, for after a restart
 		if (before === "running" && (s.state === "idle" || s.state === "error" || s.state === "waiting")) this.agentFinishedHook(s);
 		if (before !== "running" || s.state === "running" || s.state === "paused") return;
-		const visible = s === this.focusedSession && this.terminalFocused;
+		const visible = this.onScreen(s) && this.terminalFocused;
 		if (visible) return;
 		this.unread.add(s);
 		const n = this.sessions.indexOf(s) + 1;
 		const what = s.state === "error" ? "failed" : s.state === "waiting" ? "needs you" : "finished";
-		if (s !== this.focusedSession) {
+		if (!this.onScreen(s)) {
 			this.setMessage(`'${s.name}' ${what} · ${n <= 9 ? `${n} or ` : ""}]s to open it`, s.state === "error" ? "ErrorMsg" : "ModeMsg");
 		}
 		this.alert(alertSequence(`vigent: '${s.name}' ${what}`, this.ui.notify));
+	}
+
+	/** shown in the current window or any other */
+	private onScreen(s: Session): boolean {
+		return s === this.focusedSession || this.windows.all().some((w) => w !== this.windows.cur && w.session === s);
 	}
 
 	private focusSession(idx: number) {
@@ -445,7 +484,7 @@ export class App implements Component {
 	}
 
 	invalidate(): void {
-		this.paneCache.key = "";
+		this.paneCache.clear();
 	}
 
 	// ------------------------------------------------------------------ input
@@ -497,7 +536,8 @@ export class App implements Component {
 			this.tui.requestRender();
 			return;
 		}
-		const key = keyFromInput(data);
+		// <C-j> is a bare newline, which pi-tui reads as Enter; only NORMAL mode can tell them apart safely (a shift+Enter mapping sends it too)
+		const key = data === "\n" && this.mode === "NORMAL" ? "<C-j>" : keyFromInput(data);
 		if (!key) return;
 		if (this.sidebarFocused && this.sidebarKey(key)) {
 			this.tui.requestRender();
@@ -566,7 +606,7 @@ export class App implements Component {
 	}
 
 	/** Every built-in behavior, by the name used in keymaps. */
-	runAction(name: string, arg?: string) {
+	runAction(name: string, arg?: string): void {
 		const half = Math.floor(this.contentHeight() / 2);
 		const page = Math.max(1, this.contentHeight() - 2);
 		const count = this.sessions.length;
@@ -603,6 +643,17 @@ export class App implements Component {
 				return this.moveCursor(half);
 			case "cursor.half_up":
 				return this.moveCursor(-half);
+			case "cursor.page_down":
+				return this.moveCursor(page);
+			case "cursor.page_up":
+				return this.moveCursor(-page);
+			case "cursor.screen_top":
+			case "cursor.screen_middle":
+			case "cursor.screen_bottom": {
+				const { start, end } = this.viewRange(this.buildPaneLines(this.paneWidth()).length);
+				this.visual.cursor = name === "cursor.screen_top" ? start : name === "cursor.screen_bottom" ? end - 1 : start + Math.floor((end - start - 1) / 2);
+				return;
+			}
 			case "cursor.top":
 				return this.moveCursor(-Number.MAX_SAFE_INTEGER);
 			case "cursor.bottom":
@@ -678,8 +729,53 @@ export class App implements Component {
 				return this.focusSession(this.altIdx);
 			case "sidebar.focus":
 				return this.toggleSidebarFocus();
+			case "window.down":
+			case "window.up":
+				return this.goWindow(name === "window.down" ? "down" : "up");
+			case "window.next":
+			case "window.prev":
+				return this.cycleWindow(name === "window.next" ? 1 : -1);
+			case "window.last":
+				if (this.windows.prev) this.enterWindow(this.windows.prev);
+				return;
+			case "window.top":
+				return this.enterWindow(this.windows.all()[0]);
+			case "window.bottom":
+				return this.enterWindow(this.windows.all().at(-1)!);
+			case "window.vsplit":
+				return this.splitWindow("row");
+			case "window.split":
+				return this.splitWindow("column");
+			case "window.close":
+				return this.closeWindow();
+			case "window.quit":
+				return this.exec("q");
+			case "window.only":
+				this.windows.only();
+				return;
+			case "window.equal":
+				this.windows.equalize();
+				return;
+			case "window.wider":
+				return this.windows.resize("row", 1, this.paneArea());
+			case "window.narrower":
+				return this.windows.resize("row", -1, this.paneArea());
+			case "window.taller":
+				return this.windows.resize("column", 1, this.paneArea());
+			case "window.shorter":
+				return this.windows.resize("column", -1, this.paneArea());
+			case "window.max_width":
+				return this.windows.maximize("row");
+			case "window.max_height":
+				return this.windows.maximize("column");
+			case "window.exchange":
+				return this.exchangeWindow();
+			case "window.rotate":
+				return this.windows.rotate();
 			case "window.left":
 			case "window.right": {
+				const side = this.sidebarFocused ? undefined : this.windows.neighbour(name === "window.left" ? "left" : "right", this.paneArea());
+				if (side) return this.enterWindow(side);
 				// toward the sidebar focuses it, away from it comes back; <C-l> with nowhere to go keeps vim's meaning, redraw
 				const toSidebar = (name === "window.left") === (this.ui.sidebar_position !== "right");
 				if (toSidebar) {
@@ -753,9 +849,9 @@ export class App implements Component {
 			case "app.redraw":
 				return this.repaint();
 			case "app.quit":
-				return this.exec("qa");
+				return this.exec("q");
 			case "app.quit_force":
-				return this.onQuit();
+				return this.exec("q!");
 			case "app.dashboard":
 				return this.openDashboard();
 			case "session.tree":
@@ -801,7 +897,7 @@ export class App implements Component {
 
 	// ------------------------------------------------------------------ ex commands
 
-	private exec(input: string) {
+	private exec(input: string): void {
 		const bang = /^\s*!([\s\S]*)$/.exec(input);
 		if (bang) {
 			if (!bang[1].trim()) this.setMessage("E471: Argument required: :!{command}", "ErrorMsg");
@@ -816,12 +912,52 @@ export class App implements Component {
 		switch (cmd) {
 			case "":
 				return;
+			case "split":
+			case "sp":
+			case "vsplit":
+			case "vs":
+			case "vsp":
+				return this.splitWindow(cmd.startsWith("v") ? "row" : "column", arg);
+			case "only":
+			case "on":
+				this.windows.only();
+				return;
+			case "close":
+			case "clo":
+				return this.closeWindow();
+			case "wincmd":
+			case "winc":
+				return this.execWincmd(arg);
+			case "bnext":
+			case "bn":
+				return this.runAction("session.next");
+			case "bprevious":
+			case "bprev":
+			case "bp":
+			case "bNext":
+			case "bN":
+				return this.runAction("session.prev");
+			case "buffer":
+			case "b": {
+				const s = this.agentNamed(arg);
+				if (s) this.focusSession(this.sessions.indexOf(s));
+				return;
+			}
+			case "ls":
+			case "buffers":
+			case "files":
+				this.openDashboard();
+				return;
 			case "q":
-			case "qa":
 			case "quit":
-			case "qall":
 			case "x":
-			case "xa": {
+			case "wq":
+				if (this.windows.count > 1) return this.closeWindow();
+			// falls through
+			case "qa":
+			case "qall":
+			case "xa":
+			case "wqa": {
 				const running = this.sessions.filter((x) => x.state === "running").length;
 				if (running > 0) {
 					this.setMessage(
@@ -834,8 +970,10 @@ export class App implements Component {
 				return;
 			}
 			case "q!":
-			case "qa!":
 			case "quit!":
+				if (this.windows.count > 1) return this.closeWindow();
+			// falls through
+			case "qa!":
 			case "qall!":
 				this.onQuit();
 				return;
@@ -935,6 +1073,8 @@ export class App implements Component {
 				else this.exec(`new -t ${arg}`);
 				return;
 			}
+			case "bdelete":
+			case "bd":
 			case "kill":
 			case "kill!":
 				this.killFocused(cmd === "kill!");
@@ -2265,7 +2405,7 @@ export class App implements Component {
 		// one line, and emoji in text style (U+FE0F makes terminals disagree on their width)
 		const oneLine = (t: string) => t.replace(/\uFE0F/g, "").replace(/\s+/g, " ").trim();
 		const lookHere = () => {
-			if (s !== this.focusedSession || !this.terminalFocused) this.alert(alertSequence(`vigent: ${who()} asks you something`, this.ui.notify));
+			if (!this.onScreen(s) || !this.terminalFocused) this.alert(alertSequence(`vigent: ${who()} asks you something`, this.ui.notify));
 		};
 		return {
 			select: (title, options) =>
@@ -2303,7 +2443,7 @@ export class App implements Component {
 	 */
 	askToAllow(s: Session, blocked: Denial[], rules: string[]): Promise<AllowChoice> {
 		return new Promise((resolve) => {
-			if (s !== this.focusedSession || !this.terminalFocused) this.alert(alertSequence(`vigent: '${s.name}' needs a permission`, this.ui.notify));
+			if (!this.onScreen(s) || !this.terminalFocused) this.alert(alertSequence(`vigent: '${s.name}' needs a permission`, this.ui.notify));
 			const what = [...new Set(blocked.map(describeDenial))].join(" · ");
 			const list = rules.join(", ");
 			this.openChoices(
@@ -2531,6 +2671,7 @@ export class App implements Component {
 		if (this.sessions.length === 0) this.sidebarFocused = false;
 		this.server?.sync();
 		this.focusIdx = Math.max(0, Math.min(this.focusIdx, this.sessions.length - 1));
+		this.dropFromWindows(s);
 		const wt = s.worktree;
 		if (!wt?.path || !this.workspace.root) {
 			this.setMessage(`killed '${s.name}'`, "WarningMsg");
@@ -2951,7 +3092,7 @@ export class App implements Component {
 	private static readonly BOTTOM_PAD = 1;
 
 	private contentHeight(): number {
-		return Math.max(1, this.terminal.rows - 3 - App.BOTTOM_PAD);
+		return Math.max(1, this.windowRect().h - 1 - App.BOTTOM_PAD);
 	}
 
 	private scrollBy(delta: number) {
@@ -2970,7 +3111,7 @@ export class App implements Component {
 		if (!s) return;
 		for (const i of s.items) if (i.tool) i.tool.folded = folded;
 		(s as any).version++;
-		this.paneCache.key = "";
+		this.paneCache.clear();
 	}
 
 	/** Esc or :noh: the matches stop being highlighted (n still finds them) */
@@ -3085,58 +3226,144 @@ export class App implements Component {
 		return this.ui.sidebar && width >= this.ui.sidebar_width + 40 ? this.ui.sidebar_width : 0;
 	}
 
-	private paneWidth(): number {
+	/** Where the windows go: everything but the sidebar, the statusline and the command line. */
+	paneArea(): Rect {
 		const width = this.terminal.columns;
 		const sb = this.sidebarWidth(width);
-		return Math.max(20, width - sb - (sb > 0 ? 1 : 0) - 2);
+		return { x: 0, y: 0, w: width - sb - (sb > 0 ? 1 : 0), h: this.terminal.rows - 2 };
+	}
+
+	private windowRect(): Rect {
+		if (this.drawing) return this.drawing;
+		const area = this.paneArea();
+		return this.windows.rects(area).get(this.windows.cur) ?? area;
+	}
+
+	private paneWidth(): number {
+		return Math.max(20, this.windowRect().w - 2);
+	}
+
+	// ---------------------------------------------------------------- windows
+
+	/** The current window's state lives in focusIdx and scrollOffset; this writes it back before it stops being current. */
+	private saveWindow() {
+		this.windows.cur.session = this.focusedSession;
+		this.windows.cur.scroll = this.scrollOffset;
+	}
+
+	private loadWindow() {
+		const { session, scroll } = this.windows.cur;
+		const idx = session ? this.sessions.indexOf(session) : -1;
+		if (idx >= 0) this.focusIdx = idx;
+		if (session) this.unread.delete(session);
+		this.scrollOffset = scroll;
+		this.clearSearch();
+	}
+
+	private enterWindow(win: Win<Session>) {
+		if (win === this.windows.cur) return;
+		this.saveWindow();
+		this.windows.prev = this.windows.cur;
+		this.windows.cur = win;
+		this.loadWindow();
+	}
+
+	private goWindow(side: Side) {
+		const win = this.windows.neighbour(side, this.paneArea());
+		if (win) this.enterWindow(win);
+	}
+
+	/** <C-w>w goes around every window, and the sidebar counts as one. */
+	private cycleWindow(step: 1 | -1) {
+		const wins = this.windows.all();
+		if (this.sidebarFocused) return this.leaveSidebar();
+		if (wins.length === 1) return this.toggleSidebarFocus();
+		const i = wins.indexOf(this.windows.cur) + step;
+		if ((i < 0 || i >= wins.length) && this.sidebarWidth(this.terminal.columns) > 0) return this.toggleSidebarFocus();
+		this.enterWindow(wins[(i + wins.length) % wins.length]);
+	}
+
+	/** The agent a :split or :b argument names: its number, part of its name, or # for the alternate one. */
+	private agentNamed(arg: string): Session | undefined {
+		if (arg === "#") return this.sessions[this.altIdx];
+		if (/^\d+$/.test(arg)) {
+			const s = this.sessions[Number(arg) - 1];
+			if (!s) this.setMessage(`E86: Agent ${arg} does not exist`, "ErrorMsg");
+			return s;
+		}
+		const found = this.sessions.filter((s) => s.name.toLowerCase().includes(arg.toLowerCase()));
+		if (found.length === 1 && arg) return found[0];
+		this.setMessage(!arg ? "E471: Argument required" : found.length ? `E93: More than one match for ${arg}` : `E94: No matching agent for ${arg}`, "ErrorMsg");
+		return undefined;
+	}
+
+	private splitWindow(dir: SplitDir, arg = "") {
+		if (!this.focusedSession) {
+			this.setMessage("no agent to split (:new <task> starts one)", "ErrorMsg");
+			return;
+		}
+		const target = arg ? this.agentNamed(arg) : this.focusedSession;
+		if (!target) return;
+		this.saveWindow();
+		if (!this.windows.split(dir, this.paneArea())) {
+			this.setMessage("E36: Not enough room", "ErrorMsg");
+			return;
+		}
+		this.focusSession(this.sessions.indexOf(target));
+	}
+
+	private closeWindow() {
+		if (!this.windows.close(this.windows.cur)) {
+			this.setMessage("E444: Cannot close last window", "ErrorMsg");
+			return;
+		}
+		this.loadWindow();
+	}
+
+	/** <C-w>x: the two windows of a split trade what they show; the cursor stays where it is. */
+	private exchangeWindow() {
+		const other = this.windows.sibling();
+		if (!other) {
+			this.setMessage(this.windows.count > 1 ? "E443: Cannot exchange with a split window" : "E11: There is no window to exchange with", "ErrorMsg");
+			return;
+		}
+		this.saveWindow();
+		const cur = this.windows.cur;
+		[cur.session, other.session] = [other.session, cur.session];
+		[cur.scroll, other.scroll] = [other.scroll, cur.scroll];
+		this.loadWindow();
+	}
+
+	/** Called after an agent is removed: the windows showing it close (the last window stays, on the next agent). */
+	private dropFromWindows(gone: Session) {
+		for (const w of this.windows.all()) if (w !== this.windows.cur && w.session === gone) this.windows.close(w);
+		if (this.windows.count > 1 && this.windows.close(this.windows.cur)) this.loadWindow();
+	}
+
+	private execWincmd(arg: string) {
+		const action = WINCMD[arg];
+		if (action) this.runAction(action);
+		else this.setMessage(arg ? `E474: Invalid argument: ${arg}` : "E471: Argument required", "ErrorMsg");
 	}
 
 	render(width: number): string[] {
 		const P = this.painter;
 		const sideH = Math.max(1, this.terminal.rows - 2);
-		const paneH = this.contentHeight();
 		const sbW = this.sidebarWidth(width);
-		const paneW = this.paneWidth();
-
 		const sidebar = sbW > 0 ? this.renderSidebar(sbW, sideH) : [];
-		const intro = this.sessions.length === 0;
-		const paneLines = intro ? this.introLines(paneW, paneH) : this.buildPaneLines(paneW);
-		const { start } = intro ? { start: 0 } : this.viewRange(paneLines.length);
-		const view = paneLines.slice(start, start + paneH);
-		const [selA, selB] = [Math.min(this.visual.anchor, this.visual.cursor), Math.max(this.visual.anchor, this.visual.cursor)];
-		const visualBg = P.attr("Visual").bg;
-		// what's highlighted: the search being typed (incsearch), else the last one (hlsearch)
-		const term = intro ? "" : this.mode === "SEARCH" ? this.cmdBuf : this.searchQuery;
 
-		const out: string[] = [];
 		// the divider on the theme's background, so it isn't a stripe of the terminal's own
 		const sepBg = P.attr("Normal").bg;
 		const sep = sepBg ? P.on("WinSeparator", sepBg) + this.icons.sep + RESET : P.p("WinSeparator", this.icons.sep);
-		const normalBg = P.s("Normal");
+		const area = this.paneArea();
+		const panes = this.windows.count > 1 && this.windows.fits(area) ? this.drawNode(this.windows.root, this.windows.rects(area), sep) : this.drawWindow(this.windows.cur, area);
+
+		const out: string[] = [];
 		const onRight = this.ui.sidebar_position === "right";
 		for (let r = 0; r < sideH; r++) {
 			const left = sbW > 0 && !onRight ? sidebar[r] + sep : "";
 			const right = sbW > 0 && onRight ? sep + sidebar[r] : "";
-			if (r === 0) {
-				out.push(left + this.renderWinbar(paneW + 2) + right);
-				continue;
-			}
-			const vi = r - 1 - (paneH - view.length);
-			const line = vi >= 0 ? view[vi] : undefined;
-			const idx = start + vi;
-			let text = line?.text ?? "";
-			let bg = normalBg;
-			if (line && this.mode === "VISUAL" && idx >= selA && idx <= selB) {
-				// like nvim: the Visual background under the line's own colors
-				bg = P.on("Normal", visualBg);
-				text = bg + line.text.split(normalBg).join(bg);
-			} else if (line && term) {
-				// hlsearch: every match, the current one in CurSearch, the line's own colors kept
-				const current = this.curHit?.line === idx ? this.curHit.n : -1;
-				text = paintMatches(line.text, term, P.s("Search"), normalBg, current, P.s(this.mode === "SEARCH" ? "IncSearch" : "CurSearch"));
-			}
-			const pad = Math.max(0, paneW + 2 - 1 - visibleWidth(line?.plain ?? ""));
-			out.push(left + bg + " " + text + bg + " ".repeat(pad) + RESET + right);
+			out.push(left + panes[r] + right);
 		}
 		if (this.seq.waiting) {
 			// which-key: what can follow the keys typed so far, over the bottom of the screen
@@ -3146,6 +3373,78 @@ export class App implements Component {
 		out.push(this.renderStatusline(width));
 		out.push(this.renderCmdline(width));
 		return out.map((l) => truncateToWidth(l, width));
+	}
+
+	/** A split's windows, side by side or stacked; every line comes back exactly as wide as the node. */
+	private drawNode(node: Node<Session>, rects: Map<Node<Session>, Rect>, sep: string): string[] {
+		const rect = rects.get(node)!;
+		if (!isSplit(node)) {
+			const fit = (l: string) => {
+				const cut = truncateToWidth(l, rect.w);
+				return cut + " ".repeat(Math.max(0, rect.w - visibleWidth(cut)));
+			};
+			return this.drawWindow(node, rect).map(fit);
+		}
+		const a = this.drawNode(node.a, rects, sep);
+		const b = this.drawNode(node.b, rects, sep);
+		return node.dir === "column" ? [...a, ...b] : a.map((l, i) => l + sep + b[i]);
+	}
+
+	/** One window, drawn with sizes and state that are its own for the length of the call. */
+	private drawWindow(win: Win<Session>, rect: Rect): string[] {
+		const current = win === this.windows.cur;
+		const saved = { focusIdx: this.focusIdx, scrollOffset: this.scrollOffset };
+		this.drawing = rect;
+		if (!current && win.session) {
+			this.focusIdx = this.sessions.indexOf(win.session);
+			this.scrollOffset = win.scroll;
+		}
+		try {
+			return this.renderWindow(rect.h, current);
+		} finally {
+			this.drawing = undefined;
+			this.focusIdx = saved.focusIdx;
+			this.scrollOffset = saved.scrollOffset;
+		}
+	}
+
+	private renderWindow(height: number, current: boolean): string[] {
+		const P = this.painter;
+		const paneH = this.contentHeight();
+		const paneW = this.paneWidth();
+		const intro = this.sessions.length === 0;
+		const paneLines = intro ? this.introLines(paneW, paneH) : this.buildPaneLines(paneW);
+		const { start } = intro ? { start: 0 } : this.viewRange(paneLines.length);
+		const view = paneLines.slice(start, start + paneH);
+		const [selA, selB] = [Math.min(this.visual.anchor, this.visual.cursor), Math.max(this.visual.anchor, this.visual.cursor)];
+		const visualBg = P.attr("Visual").bg;
+		// what's highlighted: the search being typed (incsearch), else the last one (hlsearch)
+		const term = intro || !current ? "" : this.mode === "SEARCH" ? this.cmdBuf : this.searchQuery;
+		const normalBg = P.s("Normal");
+		const out: string[] = [];
+		for (let r = 0; r < height; r++) {
+			if (r === 0) {
+				out.push(this.renderWinbar(paneW + 2, current || this.windows.count === 1));
+				continue;
+			}
+			const vi = r - 1 - (paneH - view.length);
+			const line = vi >= 0 ? view[vi] : undefined;
+			const idx = start + vi;
+			let text = line?.text ?? "";
+			let bg = normalBg;
+			if (line && current && this.mode === "VISUAL" && idx >= selA && idx <= selB) {
+				// like nvim: the Visual background under the line's own colors
+				bg = P.on("Normal", visualBg);
+				text = bg + line.text.split(normalBg).join(bg);
+			} else if (line && term) {
+				// hlsearch: every match, the current one in CurSearch, the line's own colors kept
+				const hit = this.curHit?.line === idx ? this.curHit.n : -1;
+				text = paintMatches(line.text, term, P.s("Search"), normalBg, hit, P.s(this.mode === "SEARCH" ? "IncSearch" : "CurSearch"));
+			}
+			const pad = Math.max(0, paneW + 2 - 1 - visibleWidth(line?.plain ?? ""));
+			out.push(bg + " " + text + bg + " ".repeat(pad) + RESET);
+		}
+		return out;
 	}
 
 	/** The dashboard's one-key actions, while no agent is open (like LazyVim's start screen). */
@@ -3242,9 +3541,10 @@ export class App implements Component {
 	}
 
 	/** Neovim-style 'winbar' over the transcript: which agent, its model, where it works ([winbar] picks the parts). */
-	private renderWinbar(w: number): string {
+	private renderWinbar(w: number, active = true): string {
 		const P = this.painter;
-		const bg = P.attr("WinBar").bg ?? P.attr("Normal").bg;
+		const name = active ? "WinBar" : "WinBarNC";
+		const bg = P.attr(name).bg ?? P.attr("Normal").bg;
 		const s = this.focusedSession;
 		const part = (p: WinbarPart): { text: string; group: string } | undefined => {
 			const text = this.winbarPart(p);
@@ -3258,7 +3558,7 @@ export class App implements Component {
 		let leftW = 0;
 		// with powerline shapes (a Nerd Font), the agent's name sits in a rounded pill
 		const seps = this.style.separators;
-		const pill = seps !== "none" && this.ui.icons === "nerd" ? SEPARATOR_GLYPHS[seps] : undefined;
+		const pill = active && seps !== "none" && this.ui.icons === "nerd" ? SEPARATOR_GLYPHS[seps] : undefined;
 		const pillBg = P.attr("CursorLine").bg ?? P.attr("Visual").bg ?? bg;
 		lefts.forEach((x, i) => {
 			if (pill && x.group === "WinBar") {
@@ -3269,7 +3569,7 @@ export class App implements Component {
 				return;
 			}
 			const t = `${i ? "  " : " "}${x.text}`;
-			left += (x.group === "WinBar" ? P.on("WinBar", bg) : RESET + P.on(x.group, bg)) + t;
+			left += (x.group === "WinBar" ? P.on(name, bg) : RESET + P.on(x.group, bg)) + t;
 			leftW += visibleWidth(t);
 		});
 		// the right side gives way first (from its start: a path's end names the worktree), always two spaces before it
@@ -3680,7 +3980,9 @@ export class App implements Component {
 		const s = this.focusedSession;
 		const style = this.style;
 		const key = `${s ? `${s.id}:${s.version}` : "empty"}:${paneW}:${this.painter.generation}:${this.ui.icons}:${JSON.stringify(style)}`;
-		if (this.paneCache.key === key) return this.paneCache.lines;
+		const slot = `${s?.id}:${paneW}`;
+		const cached = this.paneCache.get(slot);
+		if (cached?.key === key) return cached.lines;
 
 		const P = this.painter;
 		const I = this.icons;
@@ -3794,7 +4096,8 @@ export class App implements Component {
 			push("", "");
 			push(P.p("Comment", "thinking…"), "thinking…");
 		}
-		this.paneCache = { lines, key };
+		if (this.paneCache.size >= 32) this.paneCache.clear(); // old widths, killed agents
+		this.paneCache.set(slot, { lines, key });
 		return lines;
 	}
 
@@ -4074,7 +4377,11 @@ const EX_HELP: [string, string][] = [
 	[":map", "list your mappings"],
 	[":let mapleader = \",\"", "change the leader key"],
 	[":model id", "switch the focused agent's model"],
-	[":q  /  :q!", "quit (asks if agents are running) / quit anyway"],
+	[":q  /  :q!", "close the split, or quit (asks if agents are running) / quit anyway"],
+	[":qa  /  :qa!", "quit from any split"],
+	[":vsplit [agent]  /  :split [agent]", "show an agent beside or below (its number or name)"],
+	[":close  /  :only  /  :wincmd <key>", "close this split / close the others / any <C-w> key"],
+	[":bn  :bp  :b <agent>  :ls  :bd", "agents as buffers: next, previous, go to, list, kill"],
 	[":!{cmd}", "run a shell command in the agent's worktree; its output goes in the transcript"],
 	[":command [Name] [cmd]", "your own commands: list them, show one, or define one (| separates steps)"],
 	[":delcommand Name", "forget one of your commands"],
