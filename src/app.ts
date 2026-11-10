@@ -215,6 +215,35 @@ interface PaneLine {
 	label?: boolean;
 }
 
+/** vim stops counting somewhere too; this keeps a mistyped number from looping for long */
+const MAX_COUNT = 9999;
+
+/** Built-in actions a count repeats: 5j, 3<C-d>, 2n, 4<C-w>> */
+const REPEATABLE = new Set([
+	"scroll.down",
+	"scroll.up",
+	"scroll.half_down",
+	"scroll.half_up",
+	"scroll.page_down",
+	"scroll.page_up",
+	"cursor.down",
+	"cursor.up",
+	"cursor.half_down",
+	"cursor.half_up",
+	"cursor.page_down",
+	"cursor.page_up",
+	"session.next",
+	"session.prev",
+	"message.next",
+	"message.prev",
+	"search.next",
+	"search.prev",
+	"window.wider",
+	"window.narrower",
+	"window.taller",
+	"window.shorter",
+]);
+
 /** :wincmd {key}: what <C-w>{key} does */
 const WINCMD: Record<string, string> = {
 	h: "window.left",
@@ -254,6 +283,8 @@ export class App implements Component {
 
 	private cmdBuf = "";
 	private inputBuf = "";
+	/** digits typed so far in NORMAL or VISUAL (5j); 0 when none */
+	private pendingCount = 0;
 	private message = "";
 	private messageGroup = "Comment";
 	private scrollOffset = 0; // lines from bottom
@@ -428,7 +459,7 @@ export class App implements Component {
 		const n = this.sessions.indexOf(s) + 1;
 		const what = s.state === "error" ? "failed" : s.state === "waiting" ? "needs you" : "finished";
 		if (!this.onScreen(s)) {
-			this.setMessage(`'${s.name}' ${what} · ${n <= 9 ? `${n} or ` : ""}]s to open it`, s.state === "error" ? "ErrorMsg" : "ModeMsg");
+			this.setMessage(`'${s.name}' ${what} · ${n <= 9 ? `${formatKeys([this.keymap.leader])}${n} or ` : ""}]s to open it`, s.state === "error" ? "ErrorMsg" : "ModeMsg");
 		}
 		this.alert(alertSequence(`vigent: '${s.name}' ${what}`, this.ui.notify));
 	}
@@ -543,6 +574,10 @@ export class App implements Component {
 			this.tui.requestRender();
 			return;
 		}
+		if (this.countDigit(key)) {
+			this.tui.requestRender();
+			return;
+		}
 		if (this.mode === "NORMAL" && this.seq.pendingKeys.length === 0) this.message = "";
 		for (const k of this.splitEscape(key)) this.seq.feed(k);
 		if (this.mode === "SEARCH" && this.cmdBuf !== this.searchPreview) this.previewSearch();
@@ -573,7 +608,44 @@ export class App implements Component {
 		else if (this.mode === "COMMAND" || this.mode === "SEARCH") this.cmdBuf += text;
 	}
 
+	/** A digit that starts or extends a count, like vim's. A mapping of your own on that digit wins. */
+	private countDigit(key: string): boolean {
+		if ((this.mode !== "NORMAL" && this.mode !== "VISUAL") || this.seq.pendingKeys.length > 0 || !/^[0-9]$/.test(key)) return false;
+		if (key === "0" && this.pendingCount === 0) return false;
+		const mapped = this.keymap.lookup(this.keyMode(), [key]);
+		if (mapped.exact || mapped.prefix) return false;
+		this.pendingCount = Math.min(MAX_COUNT, this.pendingCount * 10 + Number(key));
+		this.setMessage(String(this.pendingCount), "Comment");
+		return true;
+	}
+
+	/** Run a built-in action `count` times, or the way vim reads a count for it. */
+	private runCounted(name: string, arg: string | undefined, count: number) {
+		switch (name) {
+			case "scroll.top":
+			case "scroll.bottom":
+				return this.scrollToLine(count - 1);
+			case "cursor.top":
+			case "cursor.bottom": {
+				const total = this.buildPaneLines(this.paneWidth()).length;
+				this.visual.cursor = Math.max(0, Math.min(total - 1, count - 1));
+				return this.revealLine(this.visual.cursor);
+			}
+			case "session.tab":
+				return this.focusSession(Math.min(count, this.sessions.length) - 1);
+			case "window.next": {
+				const wins = this.windows.all();
+				return this.enterWindow(wins[Math.min(count, wins.length) - 1]);
+			}
+		}
+		const times = REPEATABLE.has(name) ? count : 1;
+		for (let i = 0; i < times; i++) this.runAction(name, arg);
+	}
+
 	private runBinding(binding: Binding | undefined, keys: string[]) {
+		const count = this.pendingCount;
+		this.pendingCount = 0;
+		if (count > 0 && binding?.rhs.length === 1 && binding.rhs[0].kind === "action") return this.runCounted(binding.rhs[0].name, binding.rhs[0].arg, count);
 		if (!binding) {
 			for (const k of keys) {
 				const text = tokenText(k);
@@ -719,6 +791,7 @@ export class App implements Component {
 			case "scroll.bottom":
 				this.scrollOffset = 0;
 				return;
+			case "session.tab":
 			case "session.next":
 				if (count > 0) this.focusSession((this.focusIdx + 1) % count);
 				return;
@@ -1934,7 +2007,7 @@ export class App implements Component {
 		const groups = new Map<string, Binding[]>();
 		for (const b of this.keymap.bindings("normal")) {
 			if (b.rhs.length === 1 && b.rhs[0].kind === "nop") continue;
-			// 1-9 jump to an agent: not worth a row each
+			// <leader>1-9 jump to an agent: not worth a row each
 			if (b.rhs.length === 1 && b.rhs[0].kind === "action" && b.rhs[0].name === "session.goto") continue;
 			groups.set(b.rhsText, [...(groups.get(b.rhsText) ?? []), b]);
 		}
@@ -2992,7 +3065,7 @@ export class App implements Component {
 				const texts = g.keys.map((k) => k.text);
 				const keySegs: [string, string][] =
 					g.keys.length > 4 && groupKeyIsDigits(texts)
-						? [["Identifier", `${texts[0]}-${texts[texts.length - 1]}`]]
+						? [["Identifier", `${texts[0]}-${texts[texts.length - 1].slice(-1)}`]]
 						: g.keys.map((k, i) => [k.user ? "String" : "Identifier", (i > 0 ? " " : "") + k.text]);
 				const width = keySegs.reduce((n, [, t]) => n + visibleWidth(t), 0);
 				lines.push([
@@ -3665,7 +3738,7 @@ export class App implements Component {
 
 	/**
 	 * Neovim tree-style sidebar (neo-tree / nvim-tree look):
-	 *   winbar header, number column (session index, used by 1-9),
+	 *   winbar header, number column (session index, used by <leader>1-9),
 	 *   tree guides, cursorline on the focused session, ~ filler rows.
 	 */
 	/** <leader>e, like neo-tree in Neovim: move the cursor into the SESSIONS sidebar, or back to the transcript. */
@@ -4305,7 +4378,7 @@ function mapModes(letter: string): KeyMode[] {
 }
 
 function groupKeyIsDigits(keys: string[]): boolean {
-	return keys.every((k) => /^\d$/.test(k));
+	return keys.every((k) => /\d$/.test(k));
 }
 
 /** A key's job, short, for the which-key panel: "Start an agent in its own worktree". */

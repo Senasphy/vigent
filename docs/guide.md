@@ -154,7 +154,8 @@ The code is new each time, and every request needs it. Prompts and stops need it
 |---|---|---|
 | NORMAL | `i` / `a` / `o` | Enter INSERT and type a prompt for the focused agent (it waits in a queue if the agent is busy). With no agent yet, the prompt starts one |
 | NORMAL | `j` `k` `gg` `G` `Ctrl-d` `Ctrl-u` `{` `}` | Scroll the transcript, or jump between messages |
-| NORMAL | `]s` `[s` `1`–`9` `Ctrl-^` | Switch agents |
+| NORMAL | `]s` `[s` `<Space>1`–`9` `gt` `Ctrl-^` | Switch agents; `3gt` goes to agent 3 |
+| NORMAL, VISUAL | `5j` `3<C-d>` `2n` `40G` `4<C-w>>` | A count before a key, like vim: it repeats scrolling, cursor moves, message and search jumps, agent switches and resizes. `{N}G` and `{N}gg` go to line N, `{N}<C-w>w` to window N |
 | NORMAL | `<Space>e` | Move the cursor into the SESSIONS sidebar, like neo-tree: `j`/`k` (or `gg`/`G`, `1`–`9`) pick an agent and show it, `a` starts a new one, `dd` kills the one under the cursor (asks first), Enter / Esc / `l` / `<Space>e` go back to the transcript |
 | NORMAL | `<C-w>v` `<C-w>s` | Split the window side by side or stacked, like neovim. `:vsplit 2` or `:split <name>` opens another agent in the new window, `]s` changes the agent in the current one |
 | NORMAL | `<C-w>h` `j` `k` `l` `<C-w>w` `<C-w>p` | Move between windows and the sidebar; `<C-h>` `<C-j>` `<C-k>` `<C-l>` work too, LazyVim-style (`<C-l>` still redraws when there's nothing to its right) |

@@ -90,7 +90,7 @@ Each option can also be changed while vigent runs, with vim's `:set` syntax: `:s
 | `sidebar` | `true` | show the session sidebar (hidden anyway on narrow terminals) |
 | `sidebar_width` | `30` | sidebar width in columns, 16–80 |
 | `sidebar_position` | `"left"` | `"right"` puts the sidebar on the right; the window keys follow it (`<C-l>` goes to it, `<C-h>` back). Alias `sbp` |
-| `number` | `true` | session numbers in the sidebar (they match the `1`–`9` keys) |
+| `number` | `true` | session numbers in the sidebar (they match the `<leader>1`–`9` keys) |
 | `tilde` | `true` | `~` on empty sidebar rows |
 | `icons` | `"unicode"` | `"ascii"` swaps every glyph for plain ASCII |
 | `timeoutlen` | `1000` | ms to wait for the next key of a mapping (vim's `'timeoutlen'`, alias `tm`) |
@@ -491,6 +491,7 @@ Like vim, every mapping is non-recursive, so `:nmap` behaves like `:nnoremap`. C
 | `scroll.page_down`, `scroll.page_up` | scroll a page |
 | `scroll.top`, `scroll.bottom` | jump to the top / bottom of the transcript |
 | `session.next`, `session.prev` | next / previous session |
+| `session.tab` | next session, or session N with a count (`3gt`) |
 | `session.alternate` | the session you were on before |
 | `session.goto N` | session N, e.g. `"session.goto 3"` |
 | `session.new` | spawn a new agent |
@@ -545,7 +546,7 @@ Like vim, every mapping is non-recursive, so `:nmap` behaves like `:nnoremap`. C
 | `gg` / `G` | `scroll.top` / `scroll.bottom` |
 | `]s` / `[s` | `session.next` / `session.prev` |
 | `<C-^>` | `session.alternate` |
-| `1` … `9` | `session.goto 1` … `session.goto 9` |
+| `<leader>1` `<leader>2` `<leader>3` `<leader>4` `<leader>5` `<leader>6` `<leader>7` `<leader>8` `<leader>9` | `session.goto 1` … `session.goto 9` |
 | `za` / `zR` / `zM` | `fold.toggle` / `fold.open_all` / `fold.close_all` |
 | `n` / `N` | `search.next` / `search.prev` |
 | `{` / `}` | `message.prev` / `message.next` |
@@ -575,7 +576,7 @@ Like vim, every mapping is non-recursive, so `:nmap` behaves like `:nnoremap`. C
 | `<C-w>x` `<C-w><C-x>` | `window.exchange` |
 | `<C-w>r` `<C-w><C-r>` | `window.rotate` |
 | `<C-e>` `<C-n>` / `<C-y>` `<C-p>` | `scroll.down` / `scroll.up` |
-| `gt` / `gT` | `session.next` / `session.prev` |
+| `gt` / `gT` | `session.tab` / `session.prev` |
 | `zr` / `zm` | `fold.open_all` / `fold.close_all` |
 | `ZZ` / `ZQ` | `app.quit` / `app.quit_force` |
 | `q` | `app.quit_hint` |
