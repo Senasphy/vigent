@@ -1650,7 +1650,7 @@ export class App implements Component {
 	/** `:merge` squash-merges the agent's branch into its base in your checkout (`:merge --no-squash` merges). */
 	private execMerge(arg: string) {
 		const s = this.focusedSession;
-		const wt = s?.worktree;
+		const wt = s?.worksIn;
 		if (!s || !wt?.path || !this.workspace.root) {
 			this.setMessage(s ? `'${s.name}' has no worktree to merge` : "no agent", "ErrorMsg");
 			return;
@@ -1674,7 +1674,7 @@ export class App implements Component {
 	/** `:pr` pushes the agent's branch and opens a pull request. */
 	private execPr() {
 		const s = this.focusedSession;
-		const wt = s?.worktree;
+		const wt = s?.worksIn;
 		if (!s || !wt?.path || !this.workspace.root) {
 			this.setMessage(s ? `'${s.name}' has no worktree to open a PR from` : "no agent", "ErrorMsg");
 			return;
@@ -1701,6 +1701,8 @@ export class App implements Component {
 	hooks: Hooks = {};
 	/** [statusline] and [winbar]: what they show */
 	layout: Layout = defaultLayout();
+	/** reads the saved permissions into engineOptions again (set by the CLI; it knows where the config files are) */
+	reloadPermissions: () => void = () => {};
 	/** :trust (set by the CLI; it knows where the project's config is) */
 	trustProject: () => string = () => `no ${PROJECT_CONFIG} in this project`;
 	/** runs a hook (replaced in tests) */
@@ -1714,8 +1716,8 @@ export class App implements Component {
 			VIGENT_HOOK: hook,
 			VIGENT_AGENT: s.name,
 			VIGENT_ENGINE: s.engine,
-			VIGENT_BRANCH: s.worktree?.branch ?? "",
-			VIGENT_WORKTREE: s.worktree?.path ?? "",
+			VIGENT_BRANCH: s.worksIn?.branch ?? "",
+			VIGENT_WORKTREE: s.worksIn?.path ?? "",
 			VIGENT_REPO: this.workspace.root ?? "",
 			...extra,
 		};
@@ -1742,9 +1744,9 @@ export class App implements Component {
 	/** before_merge: :merge and :pr go ahead only when it passes. */
 	private async beforeLanding(s: Session, what: "merge" | "pr"): Promise<boolean> {
 		const cmd = this.hooks.before_merge;
-		const cwd = s.worktree?.path;
+		const cwd = s.worksIn?.path;
 		if (!cmd || !cwd) return true;
-		this.setMessage(`before_merge: ${cmd} in ${s.worktree?.branch}…`, "Comment");
+		this.setMessage(`before_merge: ${cmd} in ${s.worksIn?.branch}…`, "Comment");
 		this.tui.requestRender();
 		const r = await this.hookRunner(cmd, { cwd, env: this.hookEnv(s, "before_merge"), timeoutMs: HOOK_TIMEOUT_MS.before_merge });
 		if (r.ok) return true;
@@ -1760,7 +1762,7 @@ export class App implements Component {
 		if (!cmd) return;
 		const state = s.state === "error" ? "failed" : s.state === "waiting" ? "needs-you" : "finished";
 		void this.hookRunner(cmd, {
-			cwd: s.worktree?.path ?? this.workspace.root ?? process.cwd(),
+			cwd: s.worksIn?.path ?? this.workspace.root ?? process.cwd(),
 			env: this.hookEnv(s, "agent_finished", { VIGENT_STATE: state }),
 			timeoutMs: HOOK_TIMEOUT_MS.agent_finished,
 		}).then((r) => {
@@ -1773,10 +1775,10 @@ export class App implements Component {
 	/** `:!cmd`: a shell command in the focused agent's worktree (else the repository). Resolves to whether it passed. */
 	private async runShell(command: string, label = `:!${command}`): Promise<boolean> {
 		const s = this.focusedSession;
-		const cwd = s?.worktree?.path ?? this.workspace.root ?? process.cwd();
+		const cwd = s?.worksIn?.path ?? this.workspace.root ?? process.cwd();
 		this.setMessage(`${label} …`, "Comment");
 		this.tui.requestRender();
-		const env = { VIGENT_AGENT: s?.name ?? "", VIGENT_ENGINE: s?.engine ?? "", VIGENT_BRANCH: s?.worktree?.branch ?? "", VIGENT_WORKTREE: s?.worktree?.path ?? "", VIGENT_REPO: this.workspace.root ?? "" };
+		const env = { VIGENT_AGENT: s?.name ?? "", VIGENT_ENGINE: s?.engine ?? "", VIGENT_BRANCH: s?.worksIn?.branch ?? "", VIGENT_WORKTREE: s?.worksIn?.path ?? "", VIGENT_REPO: this.workspace.root ?? "" };
 		const r = await this.hookRunner(command, { cwd, env, timeoutMs: 15 * 60_000 });
 		const how = r.ok ? `done in ${took(r.ms)}` : r.timedOut ? `timed out after ${took(r.ms)}` : `failed (exit ${r.code}) after ${took(r.ms)}`;
 		// the output goes in the agent's transcript, where you can read and search it
@@ -2460,6 +2462,7 @@ export class App implements Component {
 	execPermissions(arg = "") {
 		const m = /^(allow|remove|unallow|deny)\s+(.+)$/.exec(arg.trim());
 		if (m) {
+			this.reloadPermissions();
 			// several rules may follow; a rule's own spaces stay inside its parentheses: Bash(npm run test:*)
 			const rules = m[2].match(/[^\s(]+(?:\([^)]*\))?/g) ?? [];
 			const allow = new Set(this.engineOptions.claude?.allow ?? []);
@@ -2480,6 +2483,7 @@ export class App implements Component {
 
 	openPermissions() {
 		this.seq.reset();
+		this.reloadPermissions();
 		const onOff = (b: boolean) => (b ? "on" : "off");
 		const cycle = <T,>(values: readonly T[], now: T, dir: 1 | -1) => values[(values.indexOf(now) + dir + values.length) % values.length];
 		const name = (id: EngineId) => {
@@ -2552,6 +2556,11 @@ export class App implements Component {
 				hint: "--force: edits and commands in its worktree (headless Cursor can't ask)",
 			},
 		];
+		// each change starts from what's saved now, so it never undoes one made in another vigent
+		for (const item of items) {
+			const change = item.change;
+			if (change) item.change = (d) => (this.reloadPermissions(), change(d));
+		}
 		let handle: { hide(): void } | undefined;
 		const float = new SettingsFloat(
 			this.painter,
@@ -2807,7 +2816,7 @@ export class App implements Component {
 		const stateGroup = (st: string) =>
 			st === "running" ? "String" : st === "waiting" ? "WarningMsg" : st === "error" ? "ErrorMsg" : "Comment";
 		this.sessions.forEach((s, i) => {
-			const st = s.worktree?.stat;
+			const st = s.worksIn?.stat;
 			const glyph = s.state === "running" ? this.spinner() : I.state[s.state];
 			const last = [...s.items].reverse().find((x) => x.kind === "agent" || x.kind === "user");
 			const stat: [string, string][] = st && (st.added || st.removed)
@@ -2819,7 +2828,7 @@ export class App implements Component {
 				[stateGroup(s.state), `${glyph} `],
 				["Title", truncateToWidth(s.name, 26, "…").padEnd(27)],
 				[stateGroup(s.state), s.state.padEnd(8)],
-				["Comment", ` ${truncateToWidth(s.worktree ? `${I.worktree}${s.worktree.branch}` : s.model, 34, "…")}`],
+				["Comment", ` ${truncateToWidth(s.worksIn ? `${I.worktree}${s.worksIn.branch}` : s.model, 34, "…")}`],
 				...stat,
 				["Comment", s.tokens ? `  ${formatUsage(s)}` : ""],
 				["Comment", s.queue.length ? `  ${I.queued}${s.queue.length}` : ""],
@@ -3244,7 +3253,7 @@ export class App implements Component {
 	/** `:review`: keep or drop the focused agent's changes hunk by hunk. */
 	private openReview() {
 		const s = this.focusedSession;
-		const wt = s?.worktree;
+		const wt = s?.worksIn;
 		if (!s || !wt?.path) {
 			this.setMessage(s ? `'${s.name}' has no worktree to review` : "no agent", "ErrorMsg");
 			return;
@@ -3287,7 +3296,7 @@ export class App implements Component {
 
 	private openDiff(split = false) {
 		const s = this.focusedSession;
-		const wt = s?.worktree;
+		const wt = s?.worksIn;
 		if (!s || !wt?.path) {
 			this.setMessage(s ? `'${s.name}' has no worktree to diff` : "no agent", "ErrorMsg");
 			return;
@@ -3777,8 +3786,11 @@ export class App implements Component {
 			this.setMessage("E36: Not enough room", "ErrorMsg");
 			return;
 		}
-		if (fork) this.addSession(fork);
-		else this.focusSession(this.sessions.indexOf(target));
+		if (fork) {
+			// it works on in its original's worktree: :diff, :merge and :pr see it there
+			fork.forkOf = parent;
+			this.addSession(fork);
+		} else this.focusSession(this.sessions.indexOf(target));
 	}
 
 	private closeWindow() {
@@ -4070,9 +4082,9 @@ export class App implements Component {
 				return [st, ext].filter(Boolean).join("  ");
 			}
 			case "path":
-				return s?.worktree?.path ? `${this.shortPath(s.worktree.path)}${s.worktree.riftri ? ` ${this.icons.light}` : ""}` : s ? "this checkout" : "";
+				return s?.worksIn?.path ? `${this.shortPath(s.worksIn.path)}${s.worksIn.riftri ? ` ${this.icons.light}` : ""}` : s ? "this checkout" : "";
 			case "branch":
-				return s?.worktree ? `${this.icons.worktree}${s.worktree.branch}` : "";
+				return s?.worksIn ? `${this.icons.worktree}${s.worksIn.branch}` : "";
 			case "usage":
 				return s ? formatUsage(s) : "";
 		}
@@ -4301,7 +4313,7 @@ export class App implements Component {
 				["Comment", s.queue.length > 0 ? ` ${I.queued}${s.queue.length}` : ""],
 				[s.state === "error" ? "ErrorMsg" : "WarningMsg", this.unread.has(s) ? ` ${I.unread}` : ""],
 			];
-			const stat = s.worktree ? this.statSegments(s.worktree.stat) : [];
+			const stat = s.worksIn ? this.statSegments(s.worksIn.stat) : [];
 			const statWidth = stat.reduce((n, [, t]) => n + visibleWidth(t), 0);
 
 			if (sidebarStyle === "compact") {
@@ -4321,7 +4333,7 @@ export class App implements Component {
 				// the focused agent opens to show where it works and what it runs on
 				if (focused) {
 					const pad = " ".repeat(visibleWidth(left[0][1]) + visibleWidth(`${glyph} `));
-					if (s.worktree) lines.push(row([["VigentSidebar", pad], ["Comment", truncateToWidth(`${I.worktree}${s.worktree.branch}`, Math.max(4, w - pad.length - 1), "…")]]));
+					if (s.worksIn) lines.push(row([["VigentSidebar", pad], ["Comment", truncateToWidth(`${I.worktree}${s.worksIn.branch}`, Math.max(4, w - pad.length - 1), "…")]]));
 					lines.push(row([["VigentSidebar", pad], ["Comment", truncateToWidth(`${model} · ${formatUsage(s)}`, Math.max(4, w - pad.length - 1), "…")]]));
 				}
 				return;
@@ -4340,8 +4352,8 @@ export class App implements Component {
 				};
 				lines.push(row([[border, `${tl}${label}${hz.repeat(Math.max(0, w - 2 - visibleWidth(label)))}${tr}`]]));
 				lines.push(card([[glyphGroup, `${glyph} `], [focused ? "Title" : "VigentSidebar", s.name], ...marks]));
-				if (s.worktree) {
-					const branch = truncateToWidth(s.worktree.branch, Math.max(4, inner - visibleWidth(I.worktree) - statWidth), "…");
+				if (s.worksIn) {
+					const branch = truncateToWidth(s.worksIn.branch, Math.max(4, inner - visibleWidth(I.worktree) - statWidth), "…");
 					lines.push(card([["Comment", `${I.worktree}${branch}`], ...stat]));
 				}
 				lines.push(card([["Comment", `${model} · ${formatUsage(s)}`]]));
@@ -4366,11 +4378,11 @@ export class App implements Component {
 				["LineNr", " ".repeat(num.length)],
 				["VigentIndent", last ? "  " : I.pipe],
 			];
-			if (s.worktree) {
+			if (s.worksIn) {
 				// the +/- counts matter more than the end of a long branch name
 				// one column spare, so the counts don't run into the divider
 				const room = w - num.length - 2 - 2 - visibleWidth(I.worktree) - statWidth - 1;
-				const branch = truncateToWidth(s.worktree.branch, Math.max(4, room), "…");
+				const branch = truncateToWidth(s.worksIn.branch, Math.max(4, room), "…");
 				lines.push(row([...indent, ["Comment", `  ${I.worktree}${branch}`], ...stat]));
 			} else {
 				lines.push(row([...indent, ["Comment", `  ${model}`]]));
@@ -4688,9 +4700,9 @@ export class App implements Component {
 			case "agent":
 				return s ? s.name : "";
 			case "branch": {
-				const st = s?.worktree?.stat;
+				const st = s?.worksIn?.stat;
 				const changes = st && (st.added || st.removed) ? ` +${st.added} ${this.icons.minus}${st.removed}` : "";
-				return s?.worktree ? `${this.icons.worktree}${s.worktree.branch}${changes}` : "";
+				return s?.worksIn ? `${this.icons.worktree}${s.worksIn.branch}${changes}` : "";
 			}
 			case "engine":
 				return s ? ENGINE_NAMES[s.engine] : "";
@@ -4705,7 +4717,7 @@ export class App implements Component {
 				return `${running}/${this.sessions.length}${running > 0 ? ` ${this.spinner()}` : ""}`;
 			}
 			case "path":
-				return s?.worktree?.path ? this.shortPath(s.worktree.path) : s ? "this checkout" : "";
+				return s?.worksIn?.path ? this.shortPath(s.worksIn.path) : s ? "this checkout" : "";
 			case "clock": {
 				const d = new Date();
 				return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
