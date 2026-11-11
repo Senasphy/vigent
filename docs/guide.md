@@ -30,7 +30,7 @@ For prompts you use often, `:new -t fix the cart total is off by one` starts an 
 
 ## Engines
 
-Each engine is an agent you install yourself: vigent runs it as installed, in the agent's worktree, so each one uses its own login and settings, and runs its own agent loop (tools, retries, context). vigent is the screen around them. vigent never reads their credentials; it only runs their version and sign-in status commands to show what's connected. If `ANTHROPIC_API_KEY` is set and Claude Code is also signed in with a Claude account, vigent runs Claude Code without that variable, so it uses your account (a key that isn't scoped to a workspace, or is out of credit, would otherwise fail every request). `:checkhealth` says so: *signed in (Claude account; ANTHROPIC_API_KEY left out)*.
+Each engine is a harness you install yourself: a program that runs the whole agent loop, from calling its model to running its tools (bash, edit, search…) and managing its context, retries and permissions. vigent runs it as installed, in the agent's worktree, so each one uses its own login and settings. vigent is the orchestrator around them: it starts them, reads what they stream, and handles queues, permissions, restarts, review and merge. vigent never reads their credentials; it only runs their version and sign-in status commands to show what's connected. If `ANTHROPIC_API_KEY` is set and Claude Code is also signed in with a Claude account, vigent runs Claude Code without that variable, so it uses your account (a key that isn't scoped to a workspace, or is out of credit, would otherwise fail every request). `:checkhealth` says so: *signed in (Claude account; ANTHROPIC_API_KEY left out)*.
 
 ```vim
 :new fix the race --engine codex            " this agent runs Codex
@@ -75,7 +75,7 @@ model_args = ["--model", "{model}"]
 | Gemini CLI | its approval mode (`default`, `auto_edit`, `yolo`) |
 | Cursor CLI | running commands without asking (`--force`) |
 
-Each change is saved to config.toml as you make it, so it stays set after a restart, and applies from each agent's next prompt, agents already open included. `:permissions allow Bash(cargo:*)` adds any other Claude Code rule (several at once work too), and `:permissions remove <rule>` takes one away. It's also a row in `:settings`. The same settings live in `[engines.<id>]` ([details](config.md#when-claude-code-is-refused-a-tool)).
+Each change is saved to config.toml as you make it, so it stays set after a restart, and applies from each agent's next prompt, agents already open included. With several vigents open, each change (and each "always allow") starts from what's saved, so one vigent never undoes another's. `:permissions allow Bash(cargo:*)` adds any other Claude Code rule (several at once work too), and `:permissions remove <rule>` takes one away. It's also a row in `:settings`. The same settings live in `[engines.<id>]` ([details](config.md#when-claude-code-is-refused-a-tool)).
 
 ### pi: extensions, skills and prompt templates
 
